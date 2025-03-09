@@ -5,8 +5,7 @@ const bodyParser = require("body-parser");
 //const dialogflow = require("@google-cloud/dialogflow");
 
 const app = express();
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const PORT = process.env.PORT || 8080;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const COLAB_API_URL = process.env.COLAB_API_URL;
 //const DIALOGFLOW_PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID;
