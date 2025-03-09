@@ -24,7 +24,7 @@ async function replyMessage(replyToken, text) {
 }
 
 // ฟังก์ชันเรียก Dialogflow เพื่อดึงข้อมูลโรค
-async function getDiseaseInfo(diseaseName) {
+/*async function getDiseaseInfo(diseaseName) {
     const sessionClient = new dialogflow.SessionsClient({ credentials: CREDENTIALS });
     const sessionPath = sessionClient.projectAgentSessionPath(DIALOGFLOW_PROJECT_ID, "12345");
 
@@ -40,7 +40,7 @@ async function getDiseaseInfo(diseaseName) {
 
     const responses = await sessionClient.detectIntent(request);
     return responses[0].queryResult.fulfillmentText;
-}
+}*/
 
 // Webhook API รับภาพจาก LINE OA
 app.post("/webhook", async (req, res) => {
@@ -60,9 +60,18 @@ app.post("/webhook", async (req, res) => {
                 });
 
                 // 2️⃣ ส่งรูปไปยัง Google Colab API
-                const colabResponse = await axios.post(COLAB_API_URL, imageBuffer.data, {
-                    headers: { "Content-Type": "application/octet-stream" },
+
+                const form = new FormData();
+                form.append('file', imageBuffer.data, { filename: 'image.jpg' });
+                
+                const colabResponse = await axios.post(COLAB_API_URL + '/classify', form, {
+                    headers: {
+                        ...form.getHeaders(), // เพิ่ม headers ของ FormData
+                    },
                 });
+                
+                console.log(colabResponse.data);
+                
 
                 const diseaseName = colabResponse.data.result || "ไม่สามารถจำแนกได้";
 
@@ -70,10 +79,10 @@ app.post("/webhook", async (req, res) => {
                 await replyMessage(replyToken, `ผลการจำแนก: ${diseaseName}`);
 
                 // 4️⃣ ส่งชื่อโรคไปที่ Dialogflow เพื่อดึงข้อมูลโรค
-                const diseaseInfo = await getDiseaseInfo(diseaseName);
+                //const diseaseInfo = await getDiseaseInfo(diseaseName);
 
                 // 5️⃣ ส่งข้อมูลโรคกลับไปที่ LINE OA
-                await replyMessage(replyToken, `ข้อมูลโรค: ${diseaseInfo}`);
+               /// await replyMessage(replyToken, `ข้อมูลโรค: ${diseaseInfo}`);
             } catch (error) {
                 console.error("Error:", error);
                 await replyMessage(replyToken, "เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง");
