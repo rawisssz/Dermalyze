@@ -92,5 +92,10 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(200);
 });
 
+app.get("/webhook", (req, res) => {
+    res.send("✅ Webhook is active!");
+});
+
+
 // เริ่มเซิร์ฟเวอร์
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
