@@ -46,6 +46,7 @@ async function getDiseaseInfo(diseaseName) {
 
 // Webhook API รับภาพจาก LINE OA
 app.post("/webhook", async (req, res) => {
+    console.log("Request body: ", req.body);
     const events = req.body.events;
     for (let event of events) {
         if (event.type === "message" && event.message.type === "image") {
@@ -65,7 +66,8 @@ app.post("/webhook", async (req, res) => {
                 const colabResponse = await axios.post(COLAB_API_URL, imageBuffer.data, {
                     headers: { "Content-Type": "application/octet-stream" },
                 });
-
+                console.log("Colab response:", colabResponse.data);  // เพิ่ม log ข้อมูลจาก Colab API
+                
                 const diseaseName = colabResponse.data.result || "ไม่สามารถจำแนกได้";
 
                 // 3️⃣ ส่งชื่อโรคกลับไปที่ LINE OA
