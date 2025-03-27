@@ -64,33 +64,42 @@ app.post("/webhook", async (req, res) => {
                     console.error('Error fetching image:', err);
                     return null;  // ถ้าเกิดข้อผิดพลาดจะส่งค่ากลับเป็น null
                 });
-                
+            
                 // ตรวจสอบหากไม่สามารถดึงรูปได้
                 if (!imageBuffer) {
                     await replyMessage(replyToken, "ไม่สามารถดึงรูปจาก LINE OA ได้");  // ส่งข้อความกลับไปที่ LINE OA
                     return;  // ออกจากฟังก์ชันหากไม่สามารถดึงรูป
                 }
-
+            
+                console.log("Image fetched successfully");
+            
                 // 2️⃣ ส่งรูปไปยัง Google Colab API
                 const colabResponse = await axios.post(COLAB_API_URL, imageBuffer.data, {
                     headers: { "Content-Type": "application/octet-stream" },
+                }).catch(err => {
+                    console.error('Error sending image to Colab:', err);
+                    return null;
                 });
+            
+                // ตรวจสอบการตอบกลับจาก Colab
+                if (!colabResponse || !colabResponse.data) {
+                    console.error("No response from Colab API");
+                    await replyMessage(replyToken, "ไม่สามารถส่งข้อมูลไปยัง Google Colab ได้");
+                    return;  // ออกจากฟังก์ชันหากไม่สามารถรับข้อมูลจาก Colab
+                }
+            
                 console.log("Colab response:", colabResponse.data);  // เพิ่ม log ข้อมูลจาก Colab API
                 
                 const diseaseName = colabResponse.data.result || "ไม่สามารถจำแนกได้";
-
+            
                 // 3️⃣ ส่งชื่อโรคกลับไปที่ LINE OA
                 await replyMessage(replyToken, `ผลการจำแนก: ${diseaseName}`);
-
-                // 4️⃣ ส่งชื่อโรคไปที่ Dialogflow เพื่อดึงข้อมูลโรค
-                //const diseaseInfo = await getDiseaseInfo(diseaseName);
-
-                // 5️⃣ ส่งข้อมูลโรคกลับไปที่ LINE OA
-                //await replyMessage(replyToken, `ข้อมูลโรค: ${diseaseInfo}`);
+            
             } catch (error) {
                 console.error("Error:", error);
                 await replyMessage(replyToken, "เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง");
             }
+            
         }
     }
     res.sendStatus(200);
