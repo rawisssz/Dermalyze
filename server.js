@@ -1,8 +1,8 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
-const bodyParser = require("body-parser");
-const dialogflow = require("@google-cloud/dialogflow");
+const bodyParser = require("body-parser")
+// const dialogflow = require("@google-cloud/dialogflow");
 const FormData = require('form-data');
 
 
@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const COLAB_API_URL = process.env.COLAB_API_URL;
 const DIALOGFLOW_PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID;
-const CREDENTIALS = require("./dialogflow-key.json"); // ไฟล์ JSON ของ Dialogflow
+//const CREDENTIALS = require("./dialogflow-key.json"); // ไฟล์ JSON ของ Dialogflow
 
 app.use(bodyParser.json());
 
