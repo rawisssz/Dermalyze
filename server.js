@@ -60,7 +60,16 @@ app.post("/webhook", async (req, res) => {
                     url: `https://api-data.line.me/v2/bot/message/${imageId}/content`,
                     headers: { "Authorization": `Bearer ${LINE_ACCESS_TOKEN}` },
                     responseType: "arraybuffer",
+                }).catch(err => {
+                    console.error('Error fetching image:', err);
+                    return null;  // ถ้าเกิดข้อผิดพลาดจะส่งค่ากลับเป็น null
                 });
+                
+                // ตรวจสอบหากไม่สามารถดึงรูปได้
+                if (!imageBuffer) {
+                    await replyMessage(replyToken, "ไม่สามารถดึงรูปจาก LINE OA ได้");  // ส่งข้อความกลับไปที่ LINE OA
+                    return;  // ออกจากฟังก์ชันหากไม่สามารถดึงรูป
+                }
 
                 // 2️⃣ ส่งรูปไปยัง Google Colab API
                 const colabResponse = await axios.post(COLAB_API_URL, imageBuffer.data, {
