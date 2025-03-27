@@ -2,14 +2,16 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const bodyParser = require("body-parser");
-//const dialogflow = require("@google-cloud/dialogflow");
+const dialogflow = require("@google-cloud/dialogflow");
+const FormData = require('form-data');
+
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const COLAB_API_URL = process.env.COLAB_API_URL;
-//const DIALOGFLOW_PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID;
-//const CREDENTIALS = require("./dialogflow-key.json"); // ไฟล์ JSON ของ Dialogflow
+const DIALOGFLOW_PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID;
+const CREDENTIALS = require("./dialogflow-key.json"); // ไฟล์ JSON ของ Dialogflow
 
 app.use(bodyParser.json());
 
@@ -24,7 +26,7 @@ async function replyMessage(replyToken, text) {
 }
 
 // ฟังก์ชันเรียก Dialogflow เพื่อดึงข้อมูลโรค
-/*async function getDiseaseInfo(diseaseName) {
+async function getDiseaseInfo(diseaseName) {
     const sessionClient = new dialogflow.SessionsClient({ credentials: CREDENTIALS });
     const sessionPath = sessionClient.projectAgentSessionPath(DIALOGFLOW_PROJECT_ID, "12345");
 
@@ -40,7 +42,7 @@ async function replyMessage(replyToken, text) {
 
     const responses = await sessionClient.detectIntent(request);
     return responses[0].queryResult.fulfillmentText;
-}*/
+}
 
 // Webhook API รับภาพจาก LINE OA
 app.post("/webhook", async (req, res) => {
@@ -60,18 +62,9 @@ app.post("/webhook", async (req, res) => {
                 });
 
                 // 2️⃣ ส่งรูปไปยัง Google Colab API
-
-                const form = new FormData();
-                form.append('file', imageBuffer.data, { filename: 'image.jpg' });
-                
-                const colabResponse = await axios.post(COLAB_API_URL + '/classify', form, {
-                    headers: {
-                        ...form.getHeaders(), // เพิ่ม headers ของ FormData
-                    },
+                const colabResponse = await axios.post(COLAB_API_URL, imageBuffer.data, {
+                    headers: { "Content-Type": "application/octet-stream" },
                 });
-                
-                console.log(colabResponse.data);
-                
 
                 const diseaseName = colabResponse.data.result || "ไม่สามารถจำแนกได้";
 
@@ -82,7 +75,7 @@ app.post("/webhook", async (req, res) => {
                 //const diseaseInfo = await getDiseaseInfo(diseaseName);
 
                 // 5️⃣ ส่งข้อมูลโรคกลับไปที่ LINE OA
-               /// await replyMessage(replyToken, `ข้อมูลโรค: ${diseaseInfo}`);
+                //await replyMessage(replyToken, `ข้อมูลโรค: ${diseaseInfo}`);
             } catch (error) {
                 console.error("Error:", error);
                 await replyMessage(replyToken, "เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง");
@@ -91,11 +84,6 @@ app.post("/webhook", async (req, res) => {
     }
     res.sendStatus(200);
 });
-
-app.get("/webhook", (req, res) => {
-    res.send("✅ Webhook is active!");
-});
-
 
 // เริ่มเซิร์ฟเวอร์
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
