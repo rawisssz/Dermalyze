@@ -2,14 +2,14 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const bodyParser = require("body-parser");
-const dialogflow = require("@google-cloud/dialogflow"); // ต้องติดตั้ง package นี้
+//const dialogflow = require("@google-cloud/dialogflow"); // ต้องติดตั้ง package นี้
 const FormData = require('form-data');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const COLAB_API_URL = process.env.COLAB_API_URL;
-const DIALOGFLOW_PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID;
+//const DIALOGFLOW_PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID;
 const CREDENTIALS = require("./dialogflow-key.json"); // ไฟล์ JSON ของ Dialogflow
 
 app.use(bodyParser.json());
