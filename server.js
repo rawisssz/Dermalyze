@@ -2,18 +2,19 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const bodyParser = require("body-parser");
-//const dialogflow = require("@google-cloud/dialogflow"); // ต้องติดตั้ง package นี้
+// const dialogflow = require("@google-cloud/dialogflow"); // คอมเมนต์บรรทัดนี้เพื่อไม่ใช้ Dialogflow
 const FormData = require('form-data');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const COLAB_API_URL = process.env.COLAB_API_URL;
-//const DIALOGFLOW_PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID;
-const CREDENTIALS = require("./dialogflow-key.json"); // ไฟล์ JSON ของ Dialogflow
+// const DIALOGFLOW_PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID; // คอมเมนต์บรรทัดนี้ออก
+// const CREDENTIALS = require("./dialogflow-key.json"); // คอมเมนต์บรรทัดนี้ออก
 
 app.use(bodyParser.json());
 
+// ฟังก์ชันส่งข้อความกลับ LINE OA
 async function replyMessage(replyToken, text) {
     await axios.post("https://api.line.me/v2/bot/message/reply", {
         replyToken: replyToken,
@@ -23,23 +24,24 @@ async function replyMessage(replyToken, text) {
     });
 }
 
-async function getDiseaseInfo(diseaseName) {
-    const sessionClient = new dialogflow.SessionsClient({ credentials: CREDENTIALS });
-    const sessionPath = sessionClient.projectAgentSessionPath(DIALOGFLOW_PROJECT_ID, "12345");
+// ฟังก์ชันนี้จะถูกคอมเมนต์ออกในตอนนี้
+// async function getDiseaseInfo(diseaseName) {
+//     const sessionClient = new dialogflow.SessionsClient({ credentials: CREDENTIALS });
+//     const sessionPath = sessionClient.projectAgentSessionPath(DIALOGFLOW_PROJECT_ID, "12345");
 
-    const request = {
-        session: sessionPath,
-        queryInput: {
-            text: {
-                text: diseaseName,
-                languageCode: "th",
-            },
-        },
-    };
+//     const request = {
+//         session: sessionPath,
+//         queryInput: {
+//             text: {
+//                 text: diseaseName,
+//                 languageCode: "th",
+//             },
+//         },
+//     };
 
-    const responses = await sessionClient.detectIntent(request);
-    return responses[0].queryResult.fulfillmentText;
-}
+//     const responses = await sessionClient.detectIntent(request);
+//     return responses[0].queryResult.fulfillmentText;
+// }
 
 app.post("/webhook", async (req, res) => {
     console.log("Request body: ", req.body);
