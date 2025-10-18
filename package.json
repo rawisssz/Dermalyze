@@ -1,21 +1,23 @@
 {
-  "name": "line-webhook-dermalyze",
+  "name": "line-webhook",
   "version": "1.0.0",
-  "description": "LINE OA webhook + TensorFlow.js skin disease classifier",
+  "description": "LINE webhook + TFJS model",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "postinstall": "npm rebuild @tensorflow/tfjs-node --build-from-source=false"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18 <21"
   },
   "dependencies": {
-    "@tensorflow/tfjs-node": "^4.21.0",
+    "@tensorflow/tfjs-node": "^4.20.0",
     "axios": "^1.8.2",
-    "body-parser": "^1.20.2",
+    "body-parser": "^1.20.3",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "form-data": "^4.0.2",
+    "long": "^5.2.3",
     "sharp": "^0.33.5"
   }
 }
