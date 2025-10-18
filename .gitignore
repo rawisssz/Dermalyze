@@ -1,0 +1,19 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn.lock
+
+# Python venv (ใช้ตอนแปลงโมเดล)
+venv*/
+.venv/
+
+# Secrets/Env
+.env
+*.env
+
+# OS/IDE junk
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
