@@ -17,19 +17,24 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 
-// ===== Config (ปรับเพื่อเพิ่มความมั่นใจ) =====
+// ===== Config =====
 const INPUT_SIZE = Number(process.env.INPUT_SIZE || 300);
-// โมเดลของเดียร์ build พร้อม Rescaling(1./255) แล้ว -> ไม่ต้องหาร 255 ซ้ำ
-const MODEL_INCLUDES_RESCALE = true;
+const MODEL_INCLUDES_RESCALE = true; // โมเดลมี Rescaling(1./255) แล้ว
 
-// Unknown policy (สมดุลขึ้น)
+// Unknown policy (global)
 const UNKNOWN_THRESHOLD = Number(process.env.UNKNOWN_THRESHOLD || 0.55);
 const MARGIN_THRESHOLD  = Number(process.env.MARGIN_THRESHOLD  || 0.08);
 const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 1.60);
 
-// Sharpen ความน่าจะเป็นหลัง softmax เพื่อยกความมั่นใจ top-1
-// gamma > 1 = คมขึ้น (แต่ไม่โอเวอร์)
+// Sharpen ความน่าจะเป็น
 const PROB_SHARPEN_GAMMA = Number(process.env.PROB_SHARPEN_GAMMA || 1.6);
+
+// === NEW: Calibration เฉพาะคลาส (env) ===
+// รูปแบบ:
+// CALIB_WEIGHTS="Eczema:1.35,Psoriasis:1.25"  (คลาสอื่นไม่ระบุ = 1)
+// PER_CLASS_THRESHOLDS="Eczema:0.50,Psoriasis:0.50"
+const CALIB_WEIGHTS_RAW = process.env.CALIB_WEIGHTS || "";
+const PER_CLASS_THRESHOLDS_RAW = process.env.PER_CLASS_THRESHOLDS || "";
 
 // ===== 1) โหลด labels + model =====
 const MODEL_DIR  = path.join(__dirname, "model");
@@ -45,6 +50,18 @@ try {
   console.error("❌ Load labels failed:", e.message);
   labels = ["ClassA", "ClassB", "Unknown"];
 }
+
+// แปลง env → map
+function parseKV(raw) {
+  const map = {};
+  raw.split(",").map(s => s.trim()).filter(Boolean).forEach(pair => {
+    const [k, v] = pair.split(":").map(x => x.trim());
+    if (k && v && !Number.isNaN(Number(v))) map[k] = Number(v);
+  });
+  return map;
+}
+const CALIB_WEIGHTS = parseKV(CALIB_WEIGHTS_RAW);          // name -> weight (>1 ดันขึ้น)
+const PER_CLASS_THRESHOLDS = parseKV(PER_CLASS_THRESHOLDS_RAW); // name -> threshold
 
 let model = null, modelReady = false, modelType = "unknown";
 (async () => {
@@ -95,25 +112,32 @@ function top2(ps) {
   }
   return { bestIdx: b[0], bestProb: b[1], secondIdx: s[0], secondProb: s[1] };
 }
-// ยกกำลังแล้ว normalize (sharpen)
 function sharpenProbs(probs, gamma) {
   const raised = probs.map(p => Math.pow(Math.max(p, 1e-12), gamma));
   const s = raised.reduce((a, b) => a + b, 0);
   return raised.map(v => v / s);
 }
-// softmax ป้องกันกรณี output ยังเป็น logits
 function softmax(arr) {
   const m = Math.max(...arr);
   const exps = arr.map(v => Math.exp(v - m));
   const s = exps.reduce((a, b) => a + b, 0);
   return exps.map(v => v / s);
 }
+// NEW: คูณน้ำหนักรายคลาสแล้ว normalize
+function applyClassWeights(probs, labels, weightMap) {
+  const w = probs.map((p, i) => p * (weightMap[labels[i]] ?? 1));
+  const s = w.reduce((a, b) => a + b, 0) || 1;
+  return w.map(v => v / s);
+}
+// NEW: threshold เฉพาะคลาส (ถ้าไม่มี ใช้ global)
+function thresholdForClass(label) {
+  return PER_CLASS_THRESHOLDS[label] ?? UNKNOWN_THRESHOLD;
+}
 
 // ===== 3) Preprocess + Predict + Unknown policy =====
 async function classifyImage(imageBuffer, { debug = false } = {}) {
   if (!modelReady) throw new Error("Model not ready");
 
-  // resize แบบ cover (crop ตรงกลาง) ให้คงสัดส่วน
   const resized = await sharp(imageBuffer, { limitInputPixels: false })
     .resize(INPUT_SIZE, INPUT_SIZE, { fit: "cover" })
     .toFormat("png")
@@ -122,7 +146,6 @@ async function classifyImage(imageBuffer, { debug = false } = {}) {
   let x = tf.node.decodeImage(resized, 3).toFloat().expandDims(0);
   if (!MODEL_INCLUDES_RESCALE) x = x.div(255);
 
-  // predict รองรับทั้ง Graph/Layers
   let y = model.predict ? model.predict(x) : null;
   if (Array.isArray(y)) y = y[0];
   if (!y || typeof y.dataSync !== "function") {
@@ -136,30 +159,30 @@ async function classifyImage(imageBuffer, { debug = false } = {}) {
     }
   }
 
-  // แปลงผล
-  const raw = Array.from(y.dataSync());
-  // ถ้าผลรวมไม่ได้ ~1 → ถือว่า logits → softmax ก่อน
+  let raw = Array.from(y.dataSync());
   const sum = raw.reduce((p, c) => p + c, 0);
   let probs = (Math.abs(sum - 1) > 1e-3) ? softmax(raw) : raw;
 
-  // ปรับคมความน่าจะเป็น (เพิ่มค่ามั่นใจอย่างมีวินัย)
+  // sharpen + class calibration
   probs = sharpenProbs(probs, PROB_SHARPEN_GAMMA);
+  probs = applyClassWeights(probs, labels, CALIB_WEIGHTS);
 
   const { bestIdx, bestProb, secondProb } = top2(probs);
+  const bestLabel = labels[bestIdx] || "Unknown";
   const ent = entropy(probs);
 
   const isUnknown =
-    (bestProb < UNKNOWN_THRESHOLD) ||
+    (bestProb < thresholdForClass(bestLabel)) ||
     (bestProb - secondProb < MARGIN_THRESHOLD) ||
     (ent > ENTROPY_THRESHOLD);
 
-  const idx = isUnknown ? (labels.length - 1) : bestIdx;
-  const label = labels[idx] || "ไม่สามารถจำแนกได้";
+  const finalIdx = isUnknown ? (labels.length - 1) : bestIdx;
+  const label = labels[finalIdx] || "Unknown";
   const score = Number((bestProb * 100).toFixed(2));
 
   if (debug) {
-    console.log("[DEBUG] probs:", probs.map(v => v.toFixed(4)));
-    console.log(`[DEBUG] best=${bestProb.toFixed(4)} second=${secondProb.toFixed(4)} H=${ent.toFixed(4)}`);
+    console.log("[DEBUG] probs(sharpen+calib):", probs.map(v => v.toFixed(4)));
+    console.log(`[DEBUG] best=${bestLabel} ${bestProb.toFixed(4)} second=${secondProb.toFixed(4)} H=${ent.toFixed(4)} thr=${thresholdForClass(bestLabel)}`);
   }
 
   tf.dispose([x, y]);
@@ -212,10 +235,12 @@ app.get("/", (_req, res) => res.send("Webhook is working!"));
 app.get("/healthz", (_req, res) => res.json({
   ok: true, modelReady, modelType,
   nLabels: labels.length,
-  thresholds: { UNKNOWN_THRESHOLD, MARGIN_THRESHOLD, ENTROPY_THRESHOLD, PROB_SHARPEN_GAMMA }
+  thresholds: {
+    UNKNOWN_THRESHOLD, MARGIN_THRESHOLD, ENTROPY_THRESHOLD, PROB_SHARPEN_GAMMA,
+    PER_CLASS_THRESHOLDS, CALIB_WEIGHTS
+  }
 }));
 
-// debug endpoint ส่งไฟล์ดิบมาทดสอบ
 app.post("/debug/classify", express.raw({ type: "*/*", limit: "10mb" }), async (req, res) => {
   try {
     const out = await classifyImage(req.body, { debug: true });
