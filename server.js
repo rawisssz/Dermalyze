@@ -26,15 +26,22 @@ const UNKNOWN_THRESHOLD = Number(process.env.UNKNOWN_THRESHOLD || 0.55);
 const MARGIN_THRESHOLD  = Number(process.env.MARGIN_THRESHOLD  || 0.08);
 const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 1.60);
 
-// Sharpen ความน่าจะเป็น
+// Sharpen ความน่าจะเป็น (หลังรวม TTA)
 const PROB_SHARPEN_GAMMA = Number(process.env.PROB_SHARPEN_GAMMA || 1.6);
 
-// === NEW: Calibration เฉพาะคลาส (env) ===
-// รูปแบบ:
-// CALIB_WEIGHTS="Eczema:1.35,Psoriasis:1.25"  (คลาสอื่นไม่ระบุ = 1)
-// PER_CLASS_THRESHOLDS="Eczema:0.50,Psoriasis:0.50"
-const CALIB_WEIGHTS_RAW = process.env.CALIB_WEIGHTS || "";
-const PER_CLASS_THRESHOLDS_RAW = process.env.PER_CLASS_THRESHOLDS || "";
+// Calibration เฉพาะคลาส (ผ่าน env)
+// ตัวอย่าง: CALIB_WEIGHTS="Eczema:1.45,Psoriasis:1.25,Shingles:1.40"
+// ตัวอย่าง: PER_CLASS_THRESHOLDS="Eczema:0.48,Shingles:0.48"
+function parseKV(raw) {
+  const map = {};
+  (raw || "").split(",").map(s => s.trim()).filter(Boolean).forEach(pair => {
+    const [k, v] = pair.split(":").map(x => x.trim());
+    if (k && v && !Number.isNaN(Number(v))) map[k] = Number(v);
+  });
+  return map;
+}
+const CALIB_WEIGHTS = parseKV(process.env.CALIB_WEIGHTS);
+const PER_CLASS_THRESHOLDS = parseKV(process.env.PER_CLASS_THRESHOLDS);
 
 // ===== 1) โหลด labels + model =====
 const MODEL_DIR  = path.join(__dirname, "model");
@@ -51,34 +58,23 @@ try {
   labels = ["ClassA", "ClassB", "Unknown"];
 }
 
-// แปลง env → map
-function parseKV(raw) {
-  const map = {};
-  raw.split(",").map(s => s.trim()).filter(Boolean).forEach(pair => {
-    const [k, v] = pair.split(":").map(x => x.trim());
-    if (k && v && !Number.isNaN(Number(v))) map[k] = Number(v);
-  });
-  return map;
-}
-const CALIB_WEIGHTS = parseKV(CALIB_WEIGHTS_RAW);          // name -> weight (>1 ดันขึ้น)
-const PER_CLASS_THRESHOLDS = parseKV(PER_CLASS_THRESHOLDS_RAW); // name -> threshold
-
 let model = null, modelReady = false, modelType = "unknown";
 (async () => {
   try {
+    // ส่วนใหญ่ของเดียร์เป็น GraphModel
+    model = await tf.loadGraphModel(MODEL_PATH);
+    modelType = "graph";
+    modelReady = true;
+    console.log("✅ TFJS GraphModel loaded");
+  } catch {
     try {
-      model = await tf.loadGraphModel(MODEL_PATH);
-      modelType = "graph";
-      modelReady = true;
-      console.log("✅ TFJS GraphModel loaded");
-    } catch {
       model = await tf.loadLayersModel(MODEL_PATH);
       modelType = "layers";
       modelReady = true;
       console.log("✅ TFJS LayersModel loaded");
+    } catch (err) {
+      console.error("❌ Failed to load model:", err);
     }
-  } catch (err) {
-    console.error("❌ Failed to load model:", err);
   }
 })();
 
@@ -123,18 +119,52 @@ function softmax(arr) {
   const s = exps.reduce((a, b) => a + b, 0);
   return exps.map(v => v / s);
 }
-// NEW: คูณน้ำหนักรายคลาสแล้ว normalize
 function applyClassWeights(probs, labels, weightMap) {
   const w = probs.map((p, i) => p * (weightMap[labels[i]] ?? 1));
   const s = w.reduce((a, b) => a + b, 0) || 1;
   return w.map(v => v / s);
 }
-// NEW: threshold เฉพาะคลาส (ถ้าไม่มี ใช้ global)
 function thresholdForClass(label) {
-  return PER_CLASS_THRESHOLDS[label] ?? UNKNOWN_THRESHOLD;
+  return (PER_CLASS_THRESHOLDS && PER_CLASS_THRESHOLDS[label] != null)
+    ? PER_CLASS_THRESHOLDS[label]
+    : UNKNOWN_THRESHOLD;
 }
 
-// ===== 3) Preprocess + Predict + Unknown policy =====
+// ===== TTA helpers (ใช้ tf.ops เพื่อไม่ต้องเขียนไฟล์ใหม่) =====
+function ttaVariants(img4D) {
+  // img4D: [1,H,W,3] float32 0..255 หรือ 0..1 (ขึ้นกับ MODEL_INCLUDES_RESCALE)
+  const x = img4D;
+  const xs = [];
+
+  // 1) original
+  xs.push(x);
+
+  // 2) flip LR
+  xs.push(tf.image.flipLeftRight(x));
+
+  // 3) brighten up ~ +10%
+  xs.push(tf.image.adjustBrightness(x, MODEL_INCLUDES_RESCALE ? 0.10 : 25.5));
+
+  // 4) darken ~ -10%
+  xs.push(tf.image.adjustBrightness(x, MODEL_INCLUDES_RESCALE ? -0.10 : -25.5));
+
+  // 5) contrast 1.1
+  const c = tf.image.adjustContrast(
+    MODEL_INCLUDES_RESCALE ? x.div(1) : x.div(255), 1.1
+  );
+  xs.push(MODEL_INCLUDES_RESCALE ? c : c.mul(255));
+
+  return xs;
+}
+
+function averageProbs(listOfProbs) {
+  const n = listOfProbs.length;
+  const sum = new Array(listOfProbs[0].length).fill(0);
+  for (const ps of listOfProbs) for (let i = 0; i < ps.length; i++) sum[i] += ps[i];
+  return sum.map(v => v / n);
+}
+
+// ===== 3) Preprocess + Predict + Unknown policy (with TTA) =====
 async function classifyImage(imageBuffer, { debug = false } = {}) {
   if (!modelReady) throw new Error("Model not ready");
 
@@ -144,24 +174,35 @@ async function classifyImage(imageBuffer, { debug = false } = {}) {
     .toBuffer();
 
   let x = tf.node.decodeImage(resized, 3).toFloat().expandDims(0);
-  if (!MODEL_INCLUDES_RESCALE) x = x.div(255);
+  if (!MODEL_INCLUDES_RESCALE) x = x; else x = x; // โมเดลมี Rescale ภายในแล้ว
 
-  let y = model.predict ? model.predict(x) : null;
-  if (Array.isArray(y)) y = y[0];
-  if (!y || typeof y.dataSync !== "function") {
-    try {
-      const feedName  = model.inputs?.[0]?.name;
-      const fetchName = model.outputs?.[0]?.name;
-      y = model.execute(feedName ? { [feedName]: x } : x, fetchName);
-    } catch (e) {
-      tf.dispose(x);
-      throw e;
+  // ทำ TTA → ทำนายหลายครั้ง
+  const variants = ttaVariants(x);
+  const probsList = [];
+  for (const v of variants) {
+    let y = model.predict ? model.predict(v) : null;
+    if (Array.isArray(y)) y = y[0];
+    if (!y || typeof y.dataSync !== "function") {
+      try {
+        const feedName  = model.inputs?.[0]?.name;
+        const fetchName = model.outputs?.[0]?.name;
+        y = model.execute(feedName ? { [feedName]: v } : v, fetchName);
+      } catch (e) {
+        tf.dispose([x, ...variants]);
+        throw e;
+      }
     }
+
+    let raw = Array.from(y.dataSync());
+    const sum = raw.reduce((p, c) => p + c, 0);
+    let probs = (Math.abs(sum - 1) > 1e-3) ? softmax(raw) : raw;
+    probsList.push(probs);
+
+    tf.dispose(y);
   }
 
-  let raw = Array.from(y.dataSync());
-  const sum = raw.reduce((p, c) => p + c, 0);
-  let probs = (Math.abs(sum - 1) > 1e-3) ? softmax(raw) : raw;
+  // รวมผล TTA
+  let probs = averageProbs(probsList);
 
   // sharpen + class calibration
   probs = sharpenProbs(probs, PROB_SHARPEN_GAMMA);
@@ -181,11 +222,11 @@ async function classifyImage(imageBuffer, { debug = false } = {}) {
   const score = Number((bestProb * 100).toFixed(2));
 
   if (debug) {
-    console.log("[DEBUG] probs(sharpen+calib):", probs.map(v => v.toFixed(4)));
+    console.log("[DEBUG] probs(TTA+sharpen+calib):", probs.map(v => v.toFixed(4)));
     console.log(`[DEBUG] best=${bestLabel} ${bestProb.toFixed(4)} second=${secondProb.toFixed(4)} H=${ent.toFixed(4)} thr=${thresholdForClass(bestLabel)}`);
   }
 
-  tf.dispose([x, y]);
+  tf.dispose([x, ...variants]);
   return { label, score, appliedUnknown: isUnknown };
 }
 
@@ -240,7 +281,6 @@ app.get("/healthz", (_req, res) => res.json({
     PER_CLASS_THRESHOLDS, CALIB_WEIGHTS
   }
 }));
-
 app.post("/debug/classify", express.raw({ type: "*/*", limit: "10mb" }), async (req, res) => {
   try {
     const out = await classifyImage(req.body, { debug: true });
