@@ -1,4 +1,5 @@
-process.env.TF_CPP_MIN_LOG_LEVEL = process.env.TF_CPP_MIN_LOG_LEVEL || "2"; // ลด log TensorFlow
+// ลด log TensorFlow (ต้องตั้งก่อน require tf)
+process.env.TF_CPP_MIN_LOG_LEVEL = process.env.TF_CPP_MIN_LOG_LEVEL || "2";
 
 require("dotenv").config();
 const express = require("express");
@@ -10,11 +11,13 @@ const fs = require("fs");
 const path = require("path");
 // const dialogflow = require("@google-cloud/dialogflow"); // จะใช้ภายหลังค่อยเปิด
 
+// ปรับพฤติกรรม sharp (ตัวเลือก)
 sharp.cache(true);
-sharp.concurrency(1);
-sharp.limitInputPixels(false);
+sharp.concurrency(1); // จำกัด concurrency เพื่อไม่ให้กินแรมบนฟรี tier
+// ❌ ห้ามใช้ sharp.limitInputPixels(false) — ไม่มีในเวอร์ชันใหม่แล้ว
 
 const app = express();
+// บน Render จะมี ENV PORT ให้มาอยู่แล้ว; local ใช้ 3000 ได้
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 
@@ -23,8 +26,8 @@ app.use(bodyParser.json());
 /* =========================
  * 1) โหลด labels + โมเดล
  * ========================= */
-const MODEL_DIR = path.join(__dirname, "model");
-const LABELS_PATH = path.join(__dirname, "class_names.json");
+const MODEL_DIR = path.join(__dirname, "model");           // ต้องมี model.json + ไฟล์ shard .bin
+const LABELS_PATH = path.join(__dirname, "class_names.json"); // ไฟล์ที่เซฟจากตอนเทรน (รวม "Unknown" เป็นตัวท้าย)
 
 let labels = [];
 try {
@@ -36,10 +39,12 @@ try {
   console.log("✅ Loaded labels:", labels);
 } catch (e) {
   console.error("❌ โหลด class_names.json ไม่ได้:", e.message);
+  // fallback กันล่ม (ควรมีไฟล์จริงในโปรดักชัน)
   labels = ["ClassA", "ClassB", "Unknown"];
 }
 
 const INPUT_SIZE = 300;
+// ตัดเข้า Unknown ด้วย threshold (Optional)
 const USE_UNKNOWN_THRESHOLD = true;
 const UNKNOWN_THRESHOLD = 0.5;
 const UNKNOWN_LABEL = labels[labels.length - 1] || "Unknown";
@@ -78,36 +83,47 @@ async function replyMessage(replyToken, text) {
 /* =========================
  * 3) ประมวลผลภาพ + จำแนก
  * ========================= */
+// หมายเหตุ: ตอนเทรนใช้ Rescaling(1./255) + include_preprocessing=False
+// ฝั่ง inference จึงต้อง normalize เองด้วย /255.0
 async function classifyImage(imageBuffer) {
   if (!model || !modelReady) throw new Error("Model is not loaded yet");
 
-  const resized = await sharp(imageBuffer)
+  // resize → PNG → tensor → normalize → [1,H,W,3]
+  // ถ้าต้องการปิดลิมิตพิกเซลของ sharp ให้ผ่านออปชันในอินสแตนซ์ (ไม่ใช้ฟังก์ชัน global)
+  const resized = await sharp(imageBuffer, { limitInputPixels: false })
     .resize(INPUT_SIZE, INPUT_SIZE, { fit: "cover" })
     .toFormat("png")
     .toBuffer();
 
-  const result = await tf.tidy(async () => {
-    const tensor = tf.node.decodeImage(resized, 3).toFloat().div(255).expandDims(0);
-    const logits = model.predict(tensor);
-    const probs = await logits.data();
+  // หลีกเลี่ยงการใช้ await ภายใน tf.tidy (เดี๋ยวกราฟโดน dispose ก่อน await เสร็จ)
+  const tensor = tf.node.decodeImage(resized, 3).toFloat().div(255).expandDims(0); // [1,300,300,3]
+  const logits = model.predict(tensor); // Tensor
 
-    let maxProb = -1, maxIdx = -1;
-    for (let i = 0; i < probs.length; i++) {
-      if (probs[i] > maxProb) { maxProb = probs[i]; maxIdx = i; }
+  // ใช้ dataSync() แบบ synchronous เพื่อให้จัดการหน่วยความจำได้ชัดเจน
+  const probs = logits.dataSync(); // Float32Array ยาวเท่า labels.length
+
+  let maxProb = -1;
+  let maxIdx = -1;
+  for (let i = 0; i < probs.length; i++) {
+    if (probs[i] > maxProb) {
+      maxProb = probs[i];
+      maxIdx = i;
     }
+  }
 
-    const numClasses = labels.length;
-    let finalIdx = maxIdx;
-    if (USE_UNKNOWN_THRESHOLD && maxProb < UNKNOWN_THRESHOLD) {
-      finalIdx = numClasses - 1;
-    }
+  const numClasses = labels.length;
+  let finalIdx = maxIdx;
+  if (USE_UNKNOWN_THRESHOLD && maxProb < UNKNOWN_THRESHOLD) {
+    finalIdx = numClasses - 1; // Unknown (ท้ายสุด)
+  }
 
-    const label = labels[finalIdx] || "ไม่สามารถจำแนกได้";
-    const score = Number((probs[maxIdx] * 100).toFixed(2));
-    return { label, score, maxIdx, maxProb, appliedUnknown: finalIdx !== maxIdx };
-  });
+  const label = labels[finalIdx] || "ไม่สามารถจำแนกได้";
+  const score = Number((probs[maxIdx] * 100).toFixed(2)); // รายงาน % ของคลาสที่คะแนนสูงสุด
 
-  return result;
+  // เก็บหน่วยความจำ
+  tf.dispose([tensor, logits]);
+
+  return { label, score, maxIdx, maxProb, appliedUnknown: finalIdx !== maxIdx };
 }
 
 /* =========================
@@ -115,6 +131,7 @@ async function classifyImage(imageBuffer) {
  * ========================= */
 app.post("/webhook", async (req, res) => {
   const events = req.body?.events || [];
+
   for (const event of events) {
     const replyToken = event.replyToken;
 
@@ -128,6 +145,7 @@ app.post("/webhook", async (req, res) => {
       if (event.type === "message" && event.message.type === "image") {
         const imageId = event.message.id;
 
+        // ดึงภาพจาก LINE
         const imgResp = await axios.get(
           `https://api-data.line.me/v2/bot/message/${imageId}/content`,
           {
@@ -137,21 +155,31 @@ app.post("/webhook", async (req, res) => {
           }
         );
 
+        // จำแนก
         const { label, score, appliedUnknown } = await classifyImage(imgResp.data);
 
+        // ตอบกลับ
         const extra = appliedUnknown ? " (จัดเป็น Unknown โดย threshold)" : "";
         await replyMessage(
           replyToken,
           `ผลการจำแนก: ${label}${extra}\nความเชื่อมั่นของคลาสสูงสุด ~${score}%`
         );
-      }
+
+        // ===== (เผื่อใช้ภายหลัง) เรียก Dialogflow =====
+        // const userId = event?.source?.userId || "anon";
+        // const sessionClient = new dialogflow.SessionsClient();
+        // const sessionPath = sessionClient.projectAgentSessionPath(process.env.DIALOGFLOW_PROJECT_ID, userId);
+        // const ask = `ข้อมูลโรค ${label}`; // Intent: DiseaseInfo
+        // const request = { session: sessionPath, queryInput: { text: { text: ask, languageCode: "th" } } };
+        // const responses = await sessionClient.detectIntent(request);
+        // const dfReply = responses?.[0]?.queryResult?.fulfillmentText || "";
+        // if (dfReply) await replyMessage(replyToken, dfReply);
 
       // กรณีผู้ใช้ส่งข้อความ
-      else if (event.type === "message" && event.message.type === "text") {
+      } else if (event.type === "message" && event.message.type === "text") {
         await replyMessage(replyToken, "ส่งรูปมาเพื่อให้ช่วยจำแนกโรคผิวหนังได้เลยค่ะ");
-      }
 
-      else {
+      } else {
         await replyMessage(replyToken, "ยังรองรับเฉพาะรูปภาพและข้อความนะคะ");
       }
     } catch (err) {
@@ -159,6 +187,7 @@ app.post("/webhook", async (req, res) => {
       await replyMessage(replyToken, "เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้งค่ะ");
     }
   }
+
   res.sendStatus(200);
 });
 
