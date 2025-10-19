@@ -10,32 +10,26 @@ const sharp = require("sharp");
 const fs = require("fs");
 const path = require("path");
 
-// ทำให้ sharp เสถียรบนโฮสต์
+// ทำให้ sharp เสถียรบน Render
 sharp.cache(true);
 sharp.concurrency(1);
 
 const app = express();
-const PORT = process.env.PORT || 3000; // Render จะกำหนดให้เอง
+const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 
-// ===== Config ปรับผ่าน ENV ได้ =====
+// ===== Config (ค่าที่ปรับแล้ว) =====
 const INPUT_SIZE = Number(process.env.INPUT_SIZE || 300);
+const MODEL_INCLUDES_RESCALE = true; // โมเดลมี Rescaling(1./255) อยู่แล้ว
 
-// IMPORTANT: โมเดลของคุณมี Rescaling(1./255) อยู่ "ในกราฟ"
-// ให้ตั้งค่าเป็น true (ดีฟอลต์ true)
-const MODEL_INCLUDES_RESCALE = String(process.env.MODEL_INCLUDES_RESCALE || "true") === "true";
-
-// กติกา Unknown (คงไว้แบบเบา ๆ ก่อน)
-const UNKNOWN_THRESHOLD = Number(process.env.UNKNOWN_THRESHOLD || 0.50);
-const MARGIN_THRESHOLD  = Number(process.env.MARGIN_THRESHOLD  || 0.05);
-const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 1.60);
-
-// ไม่แตะ softmax เอง เพราะโมเดลคุณจบด้วย softmax อยู่แล้ว
-const USE_TEMP_SOFTMAX = false;
-const SOFTMAX_TEMP     = Number(process.env.SOFTMAX_TEMP || 1.0);
+// 👇 ปรับ threshold ตามข้อเสนอ
+const UNKNOWN_THRESHOLD = 0.4;   // เดิม 0.5
+const MARGIN_THRESHOLD  = 0.07;  // เดิม 0.05
+const ENTROPY_THRESHOLD = 1.6;   // คงเดิม
+const SOFTMAX_TEMP      = 1.0;
 
 // ===== 1) โหลด labels + model =====
-const MODEL_DIR  = path.join(__dirname, "model");
+const MODEL_DIR = path.join(__dirname, "model");
 const MODEL_PATH = `file://${path.join(MODEL_DIR, "model.json")}`;
 const LABELS_PATH = path.join(__dirname, "class_names.json");
 
@@ -51,11 +45,10 @@ try {
 
 let model = null;
 let modelReady = false;
-let modelType = "unknown"; // "graph" | "layers"
+let modelType = "unknown";
 
 (async () => {
   try {
-    // โมเดลจาก tfjs-converter ส่วนมากจะเป็น GraphModel
     try {
       model = await tf.loadGraphModel(MODEL_PATH);
       modelType = "graph";
@@ -74,7 +67,7 @@ let modelType = "unknown"; // "graph" | "layers"
 
 app.use(bodyParser.json());
 
-// ===== 2) Helper: ตอบ LINE =====
+// ===== 2) Helper: ตอบกลับ LINE =====
 async function replyMessage(replyToken, text) {
   try {
     await axios.post(
@@ -114,15 +107,12 @@ function softmaxTemp(arr, t=1) {
 async function classifyImage(imageBuffer, { debug = false } = {}) {
   if (!modelReady) throw new Error("Model not ready");
 
-  // resize → PNG buffer
   const resized = await sharp(imageBuffer, { limitInputPixels: false })
     .resize(INPUT_SIZE, INPUT_SIZE, { fit: "cover" })
     .toFormat("png")
     .toBuffer();
 
-  // tensor [1,H,W,3]
   let x = tf.node.decodeImage(resized, 3).toFloat().expandDims(0);
-  // *** สำคัญ: ไม่หาร 255 ถ้าโมเดลมี Rescaling อยู่แล้ว ***
   if (!MODEL_INCLUDES_RESCALE) {
     x = x.div(255);
   }
@@ -131,7 +121,6 @@ async function classifyImage(imageBuffer, { debug = false } = {}) {
   if (Array.isArray(y)) y = y[0];
 
   if (!y || typeof y.dataSync !== "function") {
-    // GraphModel execute
     try {
       const feedName  = model.inputs?.[0]?.name;
       const fetchName = model.outputs?.[0]?.name;
@@ -144,17 +133,8 @@ async function classifyImage(imageBuffer, { debug = false } = {}) {
 
   const raw = y.dataSync();
   let probs = Array.from(raw);
-
-  // ถ้าเห็นว่าผลรวมไม่ใกล้ 1 (ไม่ใช่ softmax) ค่อย softmax เอง
   const sum = probs.reduce((p, c) => p + c, 0);
-  if (Math.abs(sum - 1) > 1e-3 || raw.some(v => v < 0) || raw.some(v => v > 1)) {
-    probs = USE_TEMP_SOFTMAX ? softmaxTemp(raw, SOFTMAX_TEMP) : softmaxTemp(raw, 1.0);
-  }
-
-  const nLogits = probs.length;
-  if (nLogits !== labels.length) {
-    console.warn(`⚠️ MISMATCH: model outputs ${nLogits} classes but labels has ${labels.length}`);
-  }
+  if (Math.abs(sum - 1) > 1e-3) probs = softmaxTemp(raw, SOFTMAX_TEMP);
 
   const { bestIdx, bestProb, secondProb } = top2(probs);
   const ent = entropy(probs);
@@ -164,24 +144,20 @@ async function classifyImage(imageBuffer, { debug = false } = {}) {
     (bestProb - secondProb < MARGIN_THRESHOLD) ||
     (ent > ENTROPY_THRESHOLD);
 
-  const activeLabels = labels.slice(0, nLogits);
-  const finalIdx = unknown ? -1 : bestIdx;
-  const label = finalIdx === -1
-    ? (labels[labels.length - 1] || "Unknown")
-    : (activeLabels[finalIdx] || "ไม่สามารถจำแนกได้");
-
+  const idx = unknown ? (labels.length - 1) : bestIdx;
+  const label = labels[idx] || "ไม่สามารถจำแนกได้";
   const score = Number((bestProb * 100).toFixed(2));
 
   if (debug) {
-    console.log("[DEBUG] probs:", probs.map(v => Number(v.toFixed(4))));
-    console.log(`[DEBUG] best=${bestProb.toFixed(4)} second=${secondProb.toFixed(4)} H=${ent.toFixed(4)} nLogits=${nLogits}`);
+    console.log("[DEBUG] probs:", probs.map(v => v.toFixed(4)));
+    console.log(`[DEBUG] best=${bestProb.toFixed(4)} second=${secondProb.toFixed(4)} H=${ent.toFixed(4)}`);
   }
 
   tf.dispose([x, y]);
-  return { label, score, appliedUnknown: unknown, nLogits };
+  return { label, score, appliedUnknown: unknown };
 }
 
-// ===== 4) LINE Webhook =====
+// ===== 4) Webhook =====
 app.post("/webhook", async (req, res) => {
   const events = req.body?.events || [];
   for (const event of events) {
@@ -227,17 +203,7 @@ app.get("/", (_req, res) => res.send("Webhook is working!"));
 app.get("/healthz", (_req, res) => res.json({
   ok: true, modelReady, modelType,
   nLabels: labels.length,
-  includesRescale: MODEL_INCLUDES_RESCALE,
   thresholds: { UNKNOWN_THRESHOLD, MARGIN_THRESHOLD, ENTROPY_THRESHOLD }
 }));
-
-app.post("/debug/classify", express.raw({ type: "*/*", limit: "10mb" }), async (req, res) => {
-  try {
-    const out = await classifyImage(req.body, { debug: true });
-    res.json(out);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
