@@ -1,4 +1,4 @@
-// ---- ลด TF logs (ต้องเซ็ตก่อน import tf) ----
+// ---- ลด log TF (ต้องมาก่อน tf) ----
 process.env.TF_CPP_MIN_LOG_LEVEL = process.env.TF_CPP_MIN_LOG_LEVEL || "2";
 
 require("dotenv").config();
@@ -10,23 +10,32 @@ const sharp = require("sharp");
 const fs = require("fs");
 const path = require("path");
 
-// ---- sharp safety ----
+// ---- sharp: ใช้ค่านิ่งๆ ที่เสถียร ----
 sharp.cache(true);
 sharp.concurrency(1);
 
 const app = express();
-const PORT = process.env.PORT || 3000; // Render จะใส่ PORT ให้เอง
+const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 
-// ---- Config (ปรับผ่าน ENV ได้) ----
-const INPUT_SIZE = Math.max(32, Math.min(1024, Number(process.env.INPUT_SIZE || 300)));
+// ===== Config (คงแนวเดิม + จูนความมั่นใจ) =====
+const INPUT_SIZE = Number(process.env.INPUT_SIZE || 300);
 
+// ⚠️ โมเดลตอนเทรนมี layers.Rescaling(1./255) อยู่แล้ว
+//    เพราะฉะนั้น *อย่า* หาร 255 ซ้ำที่ inference
+const MODEL_INCLUDES_RESCALE = true;
+
+// Unknown policy (สมดุล)
 const UNKNOWN_THRESHOLD = Number(process.env.UNKNOWN_THRESHOLD || 0.55);
-const MARGIN_THRESHOLD = Number(process.env.MARGIN_THRESHOLD || 0.08);
+const MARGIN_THRESHOLD  = Number(process.env.MARGIN_THRESHOLD  || 0.08);
 const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 1.60);
-const PROB_SHARPEN_GAMMA = Number(process.env.PROB_SHARPEN_GAMMA || 1.60);
 
-// ex: "Eczema:1.45,Shingles:1.40"
+// Sharpen (ยกกำลัง probs หลัง softmax) — คมขึ้นแบบพอดี
+const PROB_SHARPEN_GAMMA = Number(process.env.PROB_SHARPEN_GAMMA || 1.36);
+
+// (ทางเลือก) คาลิเบรตน้ำหนักคลาสหลัง softmax
+// ตัวอย่าง ENV: CALIB_WEIGHTS=Eczema:1.45,Shingles:1.40
+// ตัวอย่าง ENV: PER_CLASS_THRESHOLDS=Eczema:0.48,Shingles:0.48
 function parseMapEnv(str) {
   const map = {};
   if (!str) return map;
@@ -36,14 +45,12 @@ function parseMapEnv(str) {
   }
   return map;
 }
-const CALIB_WEIGHTS = parseMapEnv(process.env.CALIB_WEIGHTS);               // scale per class
-const PER_CLASS_THRESHOLDS = parseMapEnv(process.env.PER_CLASS_THRESHOLDS); // per-class unknown thresholds
+const CALIB_WEIGHTS        = parseMapEnv(process.env.CALIB_WEIGHTS);
+const PER_CLASS_THRESHOLDS = parseMapEnv(process.env.PER_CLASS_THRESHOLDS);
 
-// ======================================================
-// 1) Load labels + model
-// ======================================================
-const MODEL_DIR = path.join(__dirname, "model");
-const MODEL_PATH = `file://${path.join(MODEL_DIR, "model.json")}`;
+// ===== 1) โหลด labels + model =====
+const MODEL_DIR   = path.join(__dirname, "model");
+const MODEL_PATH  = `file://${path.join(MODEL_DIR, "model.json")}`;
 const LABELS_PATH = path.join(__dirname, "class_names.json");
 
 let labels = [];
@@ -57,23 +64,21 @@ try {
 }
 const UNKNOWN_LABEL_INDEX = labels.length - 1;
 
-let model = null;
-let modelReady = false;
-let modelType = "unknown"; // "layers" | "graph"
-
+let model = null, modelReady = false, modelType = "unknown";
 (async () => {
   try {
     try {
-      model = await tf.loadLayersModel(MODEL_PATH);
-      modelType = "layers";
-      modelReady = true;
-      console.log("✅ TFJS LayersModel loaded");
-    } catch (e1) {
-      console.warn("ℹ️ Not a LayersModel, trying GraphModel…");
+      // โมเดลเดิม export เป็น GraphModel (จาก tfjs-converter)
       model = await tf.loadGraphModel(MODEL_PATH);
       modelType = "graph";
       modelReady = true;
       console.log("✅ TFJS GraphModel loaded");
+    } catch {
+      // เผื่อไว้กรณีเป็น Keras LayersModel
+      model = await tf.loadLayersModel(MODEL_PATH);
+      modelType = "layers";
+      modelReady = true;
+      console.log("✅ TFJS LayersModel loaded");
     }
   } catch (err) {
     console.error("❌ Failed to load model:", err);
@@ -82,9 +87,7 @@ let modelType = "unknown"; // "layers" | "graph"
 
 app.use(bodyParser.json());
 
-// ======================================================
-// 2) LINE reply helper
-// ======================================================
+// ===== Helper: ตอบ LINE =====
 async function replyMessage(replyToken, text) {
   if (!replyToken) return;
   try {
@@ -98,48 +101,41 @@ async function replyMessage(replyToken, text) {
   }
 }
 
-// ======================================================
-// 3) Utils
-// ======================================================
-function entropy(probArray) {
+// ===== Utils =====
+function entropy(ps) {
   let h = 0;
-  for (const p of probArray) if (p > 0) h -= p * Math.log(p);
+  for (const p of ps) if (p > 0) h -= p * Math.log(p);
   return h;
 }
-function top2(probArray) {
-  let bestIdx = -1, bestProb = -1;
-  let secondIdx = -1, secondProb = -1;
-  for (let i = 0; i < probArray.length; i++) {
-    const p = probArray[i];
-    if (p > bestProb) { secondIdx = bestIdx; secondProb = bestProb; bestIdx = i; bestProb = p; }
-    else if (p > secondProb) { secondIdx = i; secondProb = p; }
+function top2(ps) {
+  let b = [-1, -1], s = [-1, -1];
+  for (let i = 0; i < ps.length; i++) {
+    const p = ps[i];
+    if (p > b[1]) { s = b; b = [i, p]; }
+    else if (p > s[1]) { s = [i, p]; }
   }
-  return { bestIdx, bestProb, secondIdx, secondProb };
+  return { bestIdx: b[0], bestProb: b[1], secondIdx: s[0], secondProb: s[1] };
 }
-
-// ให้ probs รวมเป็น 1 เสมอ และไม่เป็น NaN
-function normalizeProbs(arr) {
-  let sum = 0;
-  const safe = arr.map(v => {
+function softmax(arr) {
+  const m = Math.max(...arr);
+  const exps = arr.map(v => Math.exp(v - m));
+  const s = exps.reduce((a, b) => a + b, 0);
+  return exps.map(v => v / (s || 1));
+}
+function normalize(arr) {
+  let s = 0;
+  const clipped = arr.map(v => {
     const x = Number.isFinite(v) ? Math.max(0, v) : 0;
-    sum += x;
+    s += x;
     return x;
   });
-  if (sum <= 0) {
-    // กระจายเท่ากัน
-    const u = 1 / safe.length;
-    return Array(safe.length).fill(u);
-  }
-  return safe.map(v => v / sum);
+  if (s <= 0) return Array(arr.length).fill(1 / arr.length);
+  return clipped.map(v => v / s);
 }
-
-// Power transform (sharpen/soften) แล้ว normalize
-function powSharpen(probs, gamma) {
+function sharpen(probs, gamma) {
   if (!Number.isFinite(gamma) || gamma <= 0) return probs;
-  return normalizeProbs(probs.map(p => Math.pow(p, gamma)));
+  return normalize(probs.map(p => Math.pow(Math.max(p, 1e-12), gamma)));
 }
-
-// Calibration โดย weight ต่อคลาส แล้ว normalize
 function applyCalibration(probs, labels, weightMap) {
   if (!weightMap || !Object.keys(weightMap).length) return probs;
   const scaled = probs.map((p, i) => {
@@ -147,104 +143,81 @@ function applyCalibration(probs, labels, weightMap) {
     const w = Number.isFinite(weightMap[name]) ? weightMap[name] : 1.0;
     return p * w;
   });
-  return normalizeProbs(scaled);
+  return normalize(scaled);
 }
 
-// ======================================================
-// 4) Preprocess + Predict + Unknown policy
-// ======================================================
+// ===== 2) Preprocess + Predict + Unknown policy =====
 async function classifyImage(imageBuffer, { debug = false } = {}) {
-  if (!model || !modelReady) throw new Error("Model is not loaded yet");
+  if (!modelReady) throw new Error("Model not ready");
 
-  // --- preprocess (ปลอดภัยกับภาพทุกชนิด) ---
-  const resized = await sharp(imageBuffer, { failOn: "none" })
-    .rotate() // respect EXIF
+  // 1) Preprocess (แบบเรียบง่ายเหมือนเดิม แต่ robust ขึ้นเล็กน้อย)
+  const resized = await sharp(imageBuffer, { limitInputPixels: false })
+    .rotate() // เคารพ EXIF
     .resize(INPUT_SIZE, INPUT_SIZE, { fit: "cover" })
-    .toColorspace("rgb")
-    .raw()
-    .toBuffer({ resolveWithObject: true })
-    .then(({ data }) => data);
+    .toFormat("png")
+    .toBuffer();
 
-  const x = tf.tensor(resized, [INPUT_SIZE, INPUT_SIZE, 3], "int32")
-              .toFloat()
-              .div(255)
-              .expandDims(0); // [1,H,W,3]
+  // decode -> float32 -> (หาร 255 เฉพาะถ้าโมเดล *ไม่มี* Rescaling)
+  let x = tf.node.decodeImage(resized, 3).toFloat().expandDims(0);
+  if (!MODEL_INCLUDES_RESCALE) x = x.div(255);
 
-  let out;
-  try {
-    out = model.predict ? model.predict(x) : null;
-    if (Array.isArray(out)) out = out[0];
-
-    if (!out || typeof out.dataSync !== "function") {
-      // GraphModel execute ทางเลือก
-      const feedName = model.inputs?.[0]?.name;
+  // 2) Predict (รองรับทั้ง Graph & Layers)
+  let y = model.predict ? model.predict(x) : null;
+  if (Array.isArray(y)) y = y[0];
+  if (!y || typeof y.dataSync !== "function") {
+    try {
+      const feedName  = model.inputs?.[0]?.name;
       const fetchName = model.outputs?.[0]?.name;
-      if (!feedName) throw new Error("GraphModel feed tensor name not found");
-      out = model.execute({ [feedName]: x }, fetchName);
+      y = model.execute(feedName ? { [feedName]: x } : x, fetchName);
+    } catch (e) {
+      tf.dispose(x);
+      throw e;
     }
-  } catch (e) {
-    tf.dispose(x);
-    throw e;
   }
 
-  // ดึงค่าออกมา
-  const raw = out.dataSync(); // Float32Array
-  let probs = Array.from(raw);
-
-  // ถ้ารวมไม่ใกล้ 1 ให้ softmax ใหม่ (แต่โมเดลเรามี softmax อยู่แล้ว โดยปกติ sums~1)
-  const s = probs.reduce((p, c) => p + c, 0);
-  if (!Number.isFinite(s) || Math.abs(s - 1) > 1e-3 || probs.some(v => v < 0) || probs.some(v => v > 1)) {
-    // ทำ softmax แบบนิ่ง ๆ
-    const m = Math.max(...probs);
-    const exps = probs.map(v => Math.exp(v - m));
-    const sumExp = exps.reduce((p, c) => p + c, 0);
-    probs = exps.map(v => v / (sumExp || 1));
+  // 3) Post-process -> probs
+  let probs = Array.from(y.dataSync());
+  const sum = probs.reduce((a, b) => a + b, 0);
+  if (!Number.isFinite(sum) || Math.abs(sum - 1) > 1e-3 || probs.some(v => v < 0) || probs.some(v => v > 1)) {
+    probs = softmax(probs);
   }
 
-  // ถ้าขนาดเอาต์พุตไม่เท่ากับ labels → ถือว่าไฟล์โมเดล/labels ไม่ตรงกัน
-  if (probs.length !== labels.length) {
-    tf.dispose([x, out]);
-    throw new Error(`Model outputs ${probs.length} classes but labels has ${labels.length}`);
-  }
-
-  // 1) คาลิเบรต per-class (ดัน Eczema, Shingles ตาม ENV)
+  // 4) (ใหม่) คาลิเบรตเฉพาะคลาสที่เพี้ยน เช่น Eczema, Shingles
   probs = applyCalibration(probs, labels, CALIB_WEIGHTS);
 
-  // 2) sharpen ด้วย gamma (>1 = คมขึ้น)
-  probs = powSharpen(probs, PROB_SHARPEN_GAMMA);
+  // 5) sharpen ให้ top-1 มั่นใจกว่าเดิมเล็กน้อย (ไม่โอเวอร์)
+  probs = sharpen(probs, PROB_SHARPEN_GAMMA);
 
-  // 3) ตัดสินใจ Unknown ด้วย 3 เงื่อนไข OR (+ per-class thresholds)
+  // 6) Unknown policy
   const { bestIdx, bestProb, secondProb } = top2(probs);
   const ent = entropy(probs);
 
-  // per-class override
-  const nameBest = labels[bestIdx] || "";
-  const thrClass = Number.isFinite(PER_CLASS_THRESHOLDS[nameBest])
-    ? PER_CLASS_THRESHOLDS[nameBest]
+  // per-class threshold (ถ้าตั้งมาใน ENV) เช่น Eczema:0.48, Shingles:0.48
+  const bestName = labels[bestIdx] || "";
+  const thrClass = Number.isFinite(PER_CLASS_THRESHOLDS[bestName])
+    ? PER_CLASS_THRESHOLDS[bestName]
     : UNKNOWN_THRESHOLD;
 
-  const unknown =
+  const isUnknown =
     (bestProb < thrClass) ||
-    (bestProb - (secondProb ?? 0) < MARGIN_THRESHOLD) ||
+    (bestProb - secondProb < MARGIN_THRESHOLD) ||
     (ent > ENTROPY_THRESHOLD);
 
-  const finalIdx = unknown ? UNKNOWN_LABEL_INDEX : bestIdx;
-  const label = labels[finalIdx] || "ไม่สามารถจำแนกได้";
-  const score = Number(((unknown ? bestProb : bestProb) * 100).toFixed(2));
+  const idx = isUnknown ? UNKNOWN_LABEL_INDEX : bestIdx;
+  const label = labels[idx] || "ไม่สามารถจำแนกได้";
+  const score = Number((bestProb * 100).toFixed(2));
 
   if (debug) {
-    console.log("[DEBUG] probs:", probs.map(v => Number(v.toFixed(4))));
-    console.log("[DEBUG] best:", nameBest, bestProb.toFixed(4), "second:", (secondProb ?? 0).toFixed(4), "entropy:", ent.toFixed(4));
-    console.log("[DEBUG] thrClass:", thrClass, "unknown:", unknown);
+    console.log("[DEBUG] probs:", probs.map(v => v.toFixed(4)));
+    console.log(`[DEBUG] best=${bestName} p=${bestProb.toFixed(4)} second=${secondProb.toFixed(4)} H=${ent.toFixed(4)} thr=${thrClass}`);
+    console.log(`[DEBUG] unknown=${isUnknown}`);
   }
 
-  tf.dispose([x, out]);
-  return { label, score, appliedUnknown: unknown };
+  tf.dispose([x, y]);
+  return { label, score, appliedUnknown: isUnknown };
 }
 
-// ======================================================
-// 5) Webhook
-// ======================================================
+// ===== 3) Webhook =====
 app.post("/webhook", async (req, res) => {
   const events = req.body?.events || [];
   for (const event of events) {
@@ -258,66 +231,38 @@ app.post("/webhook", async (req, res) => {
       if (event.type === "message" && event.message.type === "image") {
         const imageId = event.message.id;
 
-        // ดึงรูปจาก LINE (retry เบาๆ)
-        let imgResp = null;
-        let lastErr = null;
-        for (let attempt = 1; attempt <= 2; attempt++) {
-          try {
-            imgResp = await axios.get(
-              `https://api-data.line.me/v2/bot/message/${imageId}/content`,
-              {
-                headers: { Authorization: `Bearer ${LINE_ACCESS_TOKEN}` },
-                responseType: "arraybuffer",
-                timeout: 20000,
-              }
-            );
-            break;
-          } catch (e) {
-            lastErr = e;
-            await new Promise(r => setTimeout(r, 200 * attempt));
+        const imgResp = await axios.get(
+          `https://api-data.line.me/v2/bot/message/${imageId}/content`,
+          {
+            headers: { Authorization: `Bearer ${LINE_ACCESS_TOKEN}` },
+            responseType: "arraybuffer",
+            timeout: 20000,
           }
-        }
-        if (!imgResp) {
-          console.error("[FETCH_IMAGE_ERROR]", {
-            status: lastErr?.response?.status,
-            data: lastErr?.response?.data?.toString?.()?.slice?.(0, 200),
-            message: lastErr?.message
-          });
-          await replyMessage(replyToken, "ดึงรูปจาก LINE ไม่สำเร็จ กรุณาลองส่งใหม่อีกครั้งค่ะ");
-          continue;
-        }
+        );
 
-        // จำแนก
-        try {
-          const { label, score, appliedUnknown } = await classifyImage(imgResp.data);
-          const extra = appliedUnknown ? " (จัดเป็น Unknown)" : "";
-          await replyMessage(
-            replyToken,
-            `ผลการจำแนก: ${label}${extra}\nความเชื่อมั่นของคลาสสูงสุด ~${score}%`
-          );
-        } catch (e) {
-          console.error("[CLASSIFY_ERROR]", e?.stack || e?.message || e);
-          await replyMessage(replyToken, "ประมวลผลภาพไม่สำเร็จ กรุณาลองใหม่อีกครั้งค่ะ (ลองส่งเป็น JPG/PNG ขนาดไม่ใหญ่เกินไป)");
-        }
-
+        const { label, score, appliedUnknown } = await classifyImage(imgResp.data);
+        const extra = appliedUnknown ? " (จัดเป็น Unknown)" : "";
+        await replyMessage(
+          replyToken,
+          `ผลการจำแนก: ${label}${extra}\nความเชื่อมั่นของคลาสสูงสุด ~${score}%`
+        );
       } else if (event.type === "message" && event.message.type === "text") {
         await replyMessage(replyToken, "ส่งรูปมาเพื่อให้ช่วยจำแนกโรคผิวหนังได้เลยค่ะ");
       } else {
         await replyMessage(replyToken, "ยังรองรับเฉพาะรูปภาพและข้อความนะคะ");
       }
     } catch (err) {
-      console.error("[WEBHOOK_TOPLEVEL_ERROR]", err?.stack || err?.message || err);
-      await replyMessage(replyToken, "เกิดข้อผิดพลาดภายในเซิร์ฟเวอร์ ลองใหม่อีกครั้งค่ะ");
+      // เก็บรายละเอียดไว้ใน log แต่ตอบผู้ใช้สั้นๆ
+      console.error("[Webhook error]", err?.stack || err?.message || err);
+      await replyMessage(replyToken, "เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้งค่ะ");
     }
   }
   res.sendStatus(200);
 });
 
-// ======================================================
-// 6) Health & debug
-// ======================================================
+// ===== 4) Health & Debug =====
 app.get("/", (_req, res) => res.send("Webhook is working!"));
-app.get("/healthz", (_req, res) => {
+app.get("/healthz", (_req, res) =>
   res.json({
     ok: true,
     modelReady,
@@ -328,7 +273,7 @@ app.get("/healthz", (_req, res) => {
     calib: CALIB_WEIGHTS,
     perClassThresholds: PER_CLASS_THRESHOLDS,
     inputSize: INPUT_SIZE
-  });
-});
+  })
+);
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
