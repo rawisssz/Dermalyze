@@ -20,7 +20,7 @@ const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 app.use(bodyParser.json());
 
 /* ========= 1) โหลด labels + โมเดล ========= */
-const MODEL_DIR = path.join(__dirname, "model");            // ต้องมี model.json + shard .bin
+const MODEL_DIR = path.join(__dirname, "model");
 const MODEL_PATH = `file://${path.join(MODEL_DIR, "model.json")}`;
 const LABELS_PATH = path.join(__dirname, "class_names.json");
 
@@ -44,7 +44,6 @@ let modelType = "unknown"; // "layers" | "graph"
 
 (async () => {
   try {
-    // 1) ลองโหลดเป็น Layers model
     try {
       model = await tf.loadLayersModel(MODEL_PATH);
       modelType = "layers";
@@ -52,7 +51,6 @@ let modelType = "unknown"; // "layers" | "graph"
       console.log("✅ Loaded TFJS LayersModel");
     } catch (e1) {
       console.warn("ℹ️ Not a LayersModel, trying GraphModel…", e1?.message);
-      // 2) ถ้าไม่ใช่ ให้โหลดเป็น Graph model
       model = await tf.loadGraphModel(MODEL_PATH);
       modelType = "graph";
       modelReady = true;
@@ -69,7 +67,10 @@ async function replyMessage(replyToken, text) {
     await axios.post(
       "https://api.line.me/v2/bot/message/reply",
       { replyToken, messages: [{ type: "text", text }] },
-      { headers: { Authorization: Bearer ${LINE_ACCESS_TOKEN} }, timeout: 15000 }
+      {
+        headers: { Authorization: `Bearer ${LINE_ACCESS_TOKEN}` },
+        timeout: 15000,
+      }
     );
   } catch (e) {
     console.error("Reply error:", e?.response?.data || e.message);
@@ -80,27 +81,22 @@ async function replyMessage(replyToken, text) {
 async function classifyImage(imageBuffer) {
   if (!model || !modelReady) throw new Error("Model is not loaded yet");
 
-  // resize → PNG buffer
   const resized = await sharp(imageBuffer, { limitInputPixels: false })
     .resize(INPUT_SIZE, INPUT_SIZE, { fit: "cover" })
     .toFormat("png")
     .toBuffer();
 
-  // [1,H,W,3] & normalize 0..1
   const x = tf.node.decodeImage(resized, 3).toFloat().div(255).expandDims(0);
 
-  // predict สำหรับทั้งสองแบบ
   let out = model.predict(x);
-  // GraphModel.predict อาจคืน Tensor[] ให้เลือกตัวแรก
   if (Array.isArray(out)) out = out[0];
 
-  // บางโมเดล graph ต้องใช้ execute/executeAsync; ถ้า predict ไม่ได้ ให้ fallback
   if (!out || typeof out.dataSync !== "function") {
     const outputs = model.outputs ? model.outputs.map(o => o.name) : undefined;
     out = model.execute ? model.execute({ [model.inputs[0].name]: x }, outputs?.[0]) : out;
   }
 
-  const probs = out.dataSync(); // Float32Array
+  const probs = out.dataSync();
   let maxProb = -1, maxIdx = -1;
   for (let i = 0; i < probs.length; i++) {
     if (probs[i] > maxProb) { maxProb = probs[i]; maxIdx = i; }
@@ -134,7 +130,7 @@ app.post("/webhook", async (req, res) => {
         const imgResp = await axios.get(
           `https://api-data.line.me/v2/bot/message/${imageId}/content`,
           {
-            headers: { Authorization: Bearer ${LINE_ACCESS_TOKEN} },
+            headers: { Authorization: `Bearer ${LINE_ACCESS_TOKEN}` },
             responseType: "arraybuffer",
             timeout: 20000,
           }
@@ -144,9 +140,8 @@ app.post("/webhook", async (req, res) => {
         const extra = appliedUnknown ? " (จัดเป็น Unknown โดย threshold)" : "";
         await replyMessage(
           replyToken,
-          ผลการจำแนก: ${label}${extra}\nความเชื่อมั่นของคลาสสูงสุด ~${score}%
+          `ผลการจำแนก: ${label}${extra}\nความเชื่อมั่นของคลาสสูงสุด ~${score}%`
         );
-
       } else if (event.type === "message" && event.message.type === "text") {
         await replyMessage(replyToken, "ส่งรูปมาเพื่อให้ช่วยจำแนกโรคผิวหนังได้เลยค่ะ");
       } else {
