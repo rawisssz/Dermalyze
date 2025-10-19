@@ -23,13 +23,13 @@ const INPUT_SIZE = Number(process.env.INPUT_SIZE || 300);
 const MODEL_INCLUDES_RESCALE = true;
 
 // Unknown policy (สมดุลขึ้น)
-const UNKNOWN_THRESHOLD = Number(process.env.UNKNOWN_THRESHOLD || 0.50);
-const MARGIN_THRESHOLD  = Number(process.env.MARGIN_THRESHOLD  || 0.06);
-const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 1.50);
+const UNKNOWN_THRESHOLD = Number(process.env.UNKNOWN_THRESHOLD || 0.55);
+const MARGIN_THRESHOLD  = Number(process.env.MARGIN_THRESHOLD  || 0.08);
+const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 1.60);
 
 // Sharpen ความน่าจะเป็นหลัง softmax เพื่อยกความมั่นใจ top-1
 // gamma > 1 = คมขึ้น (แต่ไม่โอเวอร์)
-const PROB_SHARPEN_GAMMA = Number(process.env.PROB_SHARPEN_GAMMA || 1.35);
+const PROB_SHARPEN_GAMMA = Number(process.env.PROB_SHARPEN_GAMMA || 1.6);
 
 // ===== 1) โหลด labels + model =====
 const MODEL_DIR  = path.join(__dirname, "model");
