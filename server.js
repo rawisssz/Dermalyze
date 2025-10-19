@@ -1,4 +1,4 @@
-// ลด log TF
+// ---- Lower TF logs (must be set before tf import) ----
 process.env.TF_CPP_MIN_LOG_LEVEL = process.env.TF_CPP_MIN_LOG_LEVEL || "2";
 
 require("dotenv").config();
@@ -10,16 +10,26 @@ const sharp = require("sharp");
 const fs = require("fs");
 const path = require("path");
 
+sharp.cache(true);
+sharp.concurrency(1);
+
 const app = express();
-const PORT = process.env.PORT || 3000; // Render จะกำหนดให้เอง
+// Render จะใส่ PORT ให้เอง
+const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
-const DEBUG_PRED = process.env.DEBUG_PRED === "1";
 
-app.use(bodyParser.json());
+// ---- Config (ปรับได้ผ่าน env) ----
+const INPUT_SIZE = Number(process.env.INPUT_SIZE || 300);
+const UNKNOWN_THRESHOLD = Number(process.env.UNKNOWN_THRESHOLD || 0.70);
+const MARGIN_THRESHOLD = Number(process.env.MARGIN_THRESHOLD || 0.08);
+const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 1.60);
+const SOFTMAX_TEMP = Number(process.env.SOFTMAX_TEMP || 1.5); // >1 ทำให้ prob flat ขึ้น (ระวังสูงไป)
 
-/* ========== 1) โหลด labels + โมเดล ========== */
+// ======================================================
+// 1) Load labels + model
+// ======================================================
 const MODEL_DIR = path.join(__dirname, "model");
-const MODEL_JSON = `file://${path.join(MODEL_DIR, "model.json")}`;
+const MODEL_PATH = `file://${path.join(MODEL_DIR, "model.json")}`;
 const LABELS_PATH = path.join(__dirname, "class_names.json");
 
 let labels = [];
@@ -28,40 +38,38 @@ try {
   if (!Array.isArray(labels) || labels.length < 2) throw new Error("labels invalid");
   console.log("✅ Loaded labels:", labels);
 } catch (e) {
-  console.error("❌ โหลด class_names.json ไม่ได้:", e.message);
+  console.error("❌ Load labels failed:", e.message);
   labels = ["ClassA", "ClassB", "Unknown"];
 }
 
-const NUM_CLASSES = labels.length;
-const INPUT_SIZE = 300;
-const USE_UNKNOWN_THRESHOLD = true;
-const UNKNOWN_THRESHOLD = Number(process.env.UNKNOWN_THRESHOLD ?? 0.0); // เริ่ม 0 ก่อนเพื่อทดสอบ
-
-/** @type {tf.GraphModel | tf.LayersModel | null} */
 let model = null;
 let modelReady = false;
-let modelType = "unknown"; // "graph" | "layers"
+let modelType = "unknown"; // "layers" | "graph"
 
 (async () => {
   try {
-    model = await tf.loadGraphModel(MODEL_JSON);
-    modelType = "graph";
-    modelReady = true;
-    console.log("✅ TFJS GraphModel loaded");
-  } catch (gerr) {
-    console.warn("ℹ️ loadGraphModel ล้มเหลว ลอง Layers ต่อ…", gerr?.message || gerr);
     try {
-      model = await tf.loadLayersModel(MODEL_JSON);
+      model = await tf.loadLayersModel(MODEL_PATH);
       modelType = "layers";
       modelReady = true;
       console.log("✅ TFJS LayersModel loaded");
-    } catch (lerr) {
-      console.error("❌ โหลดโมเดลไม่สำเร็จ (Graph & Layers):", lerr);
+    } catch (e1) {
+      console.warn("ℹ️ Not a LayersModel, trying GraphModel…");
+      model = await tf.loadGraphModel(MODEL_PATH);
+      modelType = "graph";
+      modelReady = true;
+      console.log("✅ TFJS GraphModel loaded");
     }
+  } catch (err) {
+    console.error("❌ Failed to load model:", err);
   }
 })();
 
-/* ========== 2) Helper LINE ========== */
+app.use(bodyParser.json());
+
+// ======================================================
+// 2) LINE reply helper
+// ======================================================
 async function replyMessage(replyToken, text) {
   try {
     await axios.post(
@@ -74,102 +82,96 @@ async function replyMessage(replyToken, text) {
   }
 }
 
-/* ========== 3) เลือก output ที่ถูก (GraphModel) ========== */
-const lastDimEquals = (t, n) => t?.shape?.length >= 1 && t.shape[t.shape.length - 1] === n;
-/** @param {tf.Tensor|tf.Tensor[]} out */
-function pickBestLogits(out, numClasses) {
-  const arr = Array.isArray(out) ? out : [out];
-  const candidates = arr.filter(t => lastDimEquals(t, numClasses));
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => a.shape.length - b.shape.length); // เอา rank ต่ำสุด
-  return candidates[0];
+// ======================================================
+/** Utils */
+// softmax with temperature
+function softmaxTemp(arr, temp = 1.0) {
+  const a = Array.from(arr, v => v / temp);
+  const m = Math.max(...a);
+  const exps = a.map(v => Math.exp(v - m));
+  const sum = exps.reduce((p, c) => p + c, 0);
+  return exps.map(v => v / sum);
+}
+function entropy(probArray) {
+  // natural log
+  let h = 0;
+  for (const p of probArray) if (p > 0) h -= p * Math.log(p);
+  return h;
+}
+function top2(probArray) {
+  let best = [-1, -1], second = [-1, -1];
+  for (let i = 0; i < probArray.length; i++) {
+    const p = probArray[i];
+    if (p > best[1]) { second = best; best = [i, p]; }
+    else if (p > second[1]) { second = [i, p]; }
+  }
+  return { bestIdx: best[0], bestProb: best[1], secondIdx: second[0], secondProb: second[1] };
 }
 
-/* ========== 4) Inference ========== */
-// สร้างภาพเป็นเทนเซอร์ [1,H,W,3] แบบต่าง ๆ
-async function makeInputTensors(imageBuffer) {
+// ======================================================
+// 3) Preprocess + Predict + Unknown policy
+// ======================================================
+async function classifyImage(imageBuffer, { debug = false } = {}) {
+  if (!model || !modelReady) throw new Error("Model is not loaded yet");
+
   const resized = await sharp(imageBuffer, { limitInputPixels: false })
     .resize(INPUT_SIZE, INPUT_SIZE, { fit: "cover" })
     .toFormat("png")
     .toBuffer();
 
-  const base = tf.node.decodeImage(resized, 3);     // uint8 [H,W,3] 0..255
-  const xRaw255 = base.toFloat().expandDims(0);     // [1,H,W,3] 0..255
-  const xDiv255 = base.toFloat().div(255).expandDims(0); // [1,H,W,3] 0..1
-  // ImageNet แบบง่าย (mean/std ของ tf.keras.applications)
-  const mean = tf.tensor1d([0.485, 0.456, 0.406]);
-  const std = tf.tensor1d([0.229, 0.224, 0.225]);
-  const xImagenet = base.toFloat().div(255).sub(mean).div(std).expandDims(0);
+  const x = tf.node.decodeImage(resized, 3).toFloat().div(255).expandDims(0);
 
-  base.dispose(); mean.dispose(); std.dispose();
-  return { xRaw255, xDiv255, xImagenet };
-}
+  let out = model.predict ? model.predict(x) : null;
+  if (Array.isArray(out)) out = out[0];
 
-// รันโมเดล 1 ครั้ง ให้คืน probs และ maxProb
-async function forwardOnce(x) {
-  let logits;
-  if (modelType === "layers") {
-    let y = /** @type {tf.LayersModel} */(model).predict(x);
-    logits = Array.isArray(y) ? y[0] : y;
-  } else {
-    const g = /** @type {tf.GraphModel} */(model);
-    const inName = g.inputs?.[0]?.name;
-    if (!inName) throw new Error("GraphModel: ไม่พบชื่อ input");
-    const rawOut = await g.executeAsync({ [inName]: x });
-    let chosen = pickBestLogits(rawOut, NUM_CLASSES) || (Array.isArray(rawOut) ? rawOut[0] : rawOut);
-    logits = chosen;
-  }
-  if (logits.shape.length > 1) logits = logits.squeeze(); // → [C]
-  const probsT = tf.softmax(logits);
-  const probs = await probsT.data();
-  const maxProb = Math.max(...probs);
-  tf.dispose([logits, probsT]);
-  return { probs, maxProb };
-}
-
-async function classifyImage(imageBuffer) {
-  if (!model || !modelReady) throw new Error("Model not ready");
-
-  const { xRaw255, xDiv255, xImagenet } = await makeInputTensors(imageBuffer);
-
-  // ลองทั้งสามโหมด แล้วเลือกตัวที่ maxProb สูงสุด
-  const tries = [];
-  tries.push({ mode: "raw255", ...(await forwardOnce(xRaw255)) });
-  tries.push({ mode: "div255", ...(await forwardOnce(xDiv255)) });
-  tries.push({ mode: "imagenet", ...(await forwardOnce(xImagenet)) });
-
-  // ทำลายอินพุต
-  tf.dispose([xRaw255, xDiv255, xImagenet]);
-
-  tries.sort((a, b) => b.maxProb - a.maxProb);
-  const best = tries[0];
-  const probs = best.probs;
-
-  // หา index สูงสุด
-  let maxIdx = 0, maxProb = probs[0];
-  for (let i = 1; i < probs.length; i++) if (probs[i] > maxProb) { maxProb = probs[i]; maxIdx = i; }
-
-  // threshold → Unknown
-  let finalIdx = maxIdx;
-  if (USE_UNKNOWN_THRESHOLD && maxProb < UNKNOWN_THRESHOLD) finalIdx = NUM_CLASSES - 1;
-
-  if (DEBUG_PRED) {
-    const top5 = [...probs].map((p, i) => ({ i, lbl: labels[i], p:+p.toFixed(4) }))
-      .sort((a,b)=>b.p-a.p).slice(0,5);
-    console.log(`🔎 mode=${best.mode} maxProb=${maxProb.toFixed(4)} top5=`, top5);
+  // บาง GraphModel อาจต้อง execute ด้วยชื่อ tensor
+  if (!out || typeof out.dataSync !== "function") {
+    try {
+      const feedName = model.inputs?.[0]?.name || Object.keys(model.executor.graph.placeholders)[0];
+      const fetchName = model.outputs?.[0]?.name;
+      out = model.execute({ [feedName]: x }, fetchName);
+    } catch (e) {
+      tf.dispose(x);
+      throw e;
+    }
   }
 
-  const label = labels[finalIdx] || "ไม่สามารถจำแนกได้";
-  const score = Number((probs[maxIdx] * 100).toFixed(2));
-  return { label, score, maxProb, appliedUnknown: finalIdx !== maxIdx, mode: best.mode };
+  const raw = out.dataSync();
+  // ถ้าผลรวมไม่ได้ใกล้ 1 ให้ทำ softmax เอง (ถือว่าเป็น logits)
+  const sum = raw.reduce((p, c) => p + c, 0);
+  const probs = (Math.abs(sum - 1) > 1e-3 || raw.some(v => v < 0) || raw.some(v => v > 1))
+    ? softmaxTemp(raw, SOFTMAX_TEMP)
+    : Array.from(raw);
+
+  const { bestIdx, bestProb, secondProb } = top2(probs);
+  const ent = entropy(probs);
+
+  // Unknown rules (OR)
+  const unknown =
+    (bestProb < UNKNOWN_THRESHOLD) ||
+    (bestProb - secondProb < MARGIN_THRESHOLD) ||
+    (ent > ENTROPY_THRESHOLD);
+
+  const idx = unknown ? (labels.length - 1) : bestIdx;
+  const label = labels[idx] || "ไม่สามารถจำแนกได้";
+  const score = Number((bestProb * 100).toFixed(2));
+
+  if (debug) {
+    console.log("[DEBUG] probs:", probs.map(v => Number(v.toFixed(4))));
+    console.log("[DEBUG] bestProb:", bestProb.toFixed(4), "second:", secondProb.toFixed(4), "entropy:", ent.toFixed(4));
+  }
+
+  tf.dispose([x, out]);
+  return { label, score, appliedUnknown: unknown };
 }
 
-/* ========== 5) LINE Webhook ========== */
+// ======================================================
+// 4) Webhook
+// ======================================================
 app.post("/webhook", async (req, res) => {
   const events = req.body?.events || [];
   for (const event of events) {
     const replyToken = event.replyToken;
-
     try {
       if (!modelReady) {
         await replyMessage(replyToken, "โมเดลกำลังโหลดอยู่ กรุณาลองอีกครั้งในไม่กี่วินาทีค่ะ");
@@ -180,11 +182,15 @@ app.post("/webhook", async (req, res) => {
         const imageId = event.message.id;
         const imgResp = await axios.get(
           `https://api-data.line.me/v2/bot/message/${imageId}/content`,
-          { headers: { Authorization: `Bearer ${LINE_ACCESS_TOKEN}` }, responseType: "arraybuffer", timeout: 20000 }
+          {
+            headers: { Authorization: `Bearer ${LINE_ACCESS_TOKEN}` },
+            responseType: "arraybuffer",
+            timeout: 20000,
+          }
         );
 
         const { label, score, appliedUnknown } = await classifyImage(imgResp.data);
-        const extra = appliedUnknown ? " (จัดเป็น Unknown โดย threshold)" : "";
+        const extra = appliedUnknown ? " (จัดเป็น Unknown)" : "";
         await replyMessage(
           replyToken,
           `ผลการจำแนก: ${label}${extra}\nความเชื่อมั่นของคลาสสูงสุด ~${score}%`
@@ -202,18 +208,24 @@ app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 });
 
-/* ========== 6) Health / Debug ========== */
+// ======================================================
+// 5) Health & debug
+// ======================================================
 app.get("/", (_req, res) => res.send("Webhook is working!"));
 app.get("/healthz", (_req, res) => res.json({
-  ok: true, modelReady, modelType, labels: labels.length, threshold: UNKNOWN_THRESHOLD
+  ok: true, modelReady, modelType,
+  nLabels: labels.length,
+  thresholds: { UNKNOWN_THRESHOLD, MARGIN_THRESHOLD, ENTROPY_THRESHOLD, SOFTMAX_TEMP }
 }));
-app.get("/debug", (_req, res) => {
-  res.json({
-    modelReady,
-    modelType,
-    inputs: (/** @type any */(model))?.inputs?.map(i => i.name),
-    outputs: (/** @type any */(model))?.outputs?.map(o => o.name),
-  });
+
+// ส่งรูปแบบ URL เพื่อดีบัก (base64) ได้ (ไม่ใช้ในโปรดักชัน)
+app.post("/debug/classify", express.raw({ type: "*/*", limit: "10mb" }), async (req, res) => {
+  try {
+    const out = await classifyImage(req.body, { debug: true });
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
