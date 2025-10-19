@@ -10,7 +10,6 @@ const sharp = require("sharp");
 const fs = require("fs");
 const path = require("path");
 
-// ---- sharp: ใช้ค่านิ่งๆ ที่เสถียร ----
 sharp.cache(true);
 sharp.concurrency(1);
 
@@ -18,24 +17,20 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 
-// ===== Config (คงแนวเดิม + จูนความมั่นใจ) =====
+// ======= Config =======
 const INPUT_SIZE = Number(process.env.INPUT_SIZE || 300);
-
-// ⚠️ โมเดลตอนเทรนมี layers.Rescaling(1./255) อยู่แล้ว
-//    เพราะฉะนั้น *อย่า* หาร 255 ซ้ำที่ inference
+// โมเดลตอนเทรนมี Rescaling(1./255) แล้ว → ห้ามหาร 255 ซ้ำ
 const MODEL_INCLUDES_RESCALE = true;
 
-// Unknown policy (สมดุล)
+// Unknown policy
 const UNKNOWN_THRESHOLD = Number(process.env.UNKNOWN_THRESHOLD || 0.55);
 const MARGIN_THRESHOLD  = Number(process.env.MARGIN_THRESHOLD  || 0.08);
 const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 1.60);
 
-// Sharpen (ยกกำลัง probs หลัง softmax) — คมขึ้นแบบพอดี
+// sharpen probs (ยกกำลังแล้ว normalize)
 const PROB_SHARPEN_GAMMA = Number(process.env.PROB_SHARPEN_GAMMA || 1.36);
 
-// (ทางเลือก) คาลิเบรตน้ำหนักคลาสหลัง softmax
-// ตัวอย่าง ENV: CALIB_WEIGHTS=Eczema:1.45,Shingles:1.40
-// ตัวอย่าง ENV: PER_CLASS_THRESHOLDS=Eczema:0.48,Shingles:0.48
+// ==== Calibration / per-class thresholds (อ่านจาก ENV + default ที่จูนไว้) ====
 function parseMapEnv(str) {
   const map = {};
   if (!str) return map;
@@ -45,10 +40,10 @@ function parseMapEnv(str) {
   }
   return map;
 }
-const CALIB_WEIGHTS        = parseMapEnv(process.env.CALIB_WEIGHTS);
-const PER_CLASS_THRESHOLDS = parseMapEnv(process.env.PER_CLASS_THRESHOLDS);
+let CALIB_WEIGHTS = parseMapEnv(process.env.CALIB_WEIGHTS);
+let PER_CLASS_THRESHOLDS = parseMapEnv(process.env.PER_CLASS_THRESHOLDS);
 
-// ===== 1) โหลด labels + model =====
+// ======= Load labels + model =======
 const MODEL_DIR   = path.join(__dirname, "model");
 const MODEL_PATH  = `file://${path.join(MODEL_DIR, "model.json")}`;
 const LABELS_PATH = path.join(__dirname, "class_names.json");
@@ -68,13 +63,11 @@ let model = null, modelReady = false, modelType = "unknown";
 (async () => {
   try {
     try {
-      // โมเดลเดิม export เป็น GraphModel (จาก tfjs-converter)
       model = await tf.loadGraphModel(MODEL_PATH);
       modelType = "graph";
       modelReady = true;
       console.log("✅ TFJS GraphModel loaded");
     } catch {
-      // เผื่อไว้กรณีเป็น Keras LayersModel
       model = await tf.loadLayersModel(MODEL_PATH);
       modelType = "layers";
       modelReady = true;
@@ -87,9 +80,8 @@ let model = null, modelReady = false, modelType = "unknown";
 
 app.use(bodyParser.json());
 
-// ===== Helper: ตอบ LINE =====
+// ======= Helpers =======
 async function replyMessage(replyToken, text) {
-  if (!replyToken) return;
   try {
     await axios.post(
       "https://api.line.me/v2/bot/message/reply",
@@ -101,7 +93,6 @@ async function replyMessage(replyToken, text) {
   }
 }
 
-// ===== Utils =====
 function entropy(ps) {
   let h = 0;
   for (const p of ps) if (p > 0) h -= p * Math.log(p);
@@ -126,8 +117,7 @@ function normalize(arr) {
   let s = 0;
   const clipped = arr.map(v => {
     const x = Number.isFinite(v) ? Math.max(0, v) : 0;
-    s += x;
-    return x;
+    s += x; return x;
   });
   if (s <= 0) return Array(arr.length).fill(1 / arr.length);
   return clipped.map(v => v / s);
@@ -146,53 +136,73 @@ function applyCalibration(probs, labels, weightMap) {
   return normalize(scaled);
 }
 
-// ===== 2) Preprocess + Predict + Unknown policy =====
+// =======  Inference (พร้อม TTA 3 วิว)  =======
 async function classifyImage(imageBuffer, { debug = false } = {}) {
   if (!modelReady) throw new Error("Model not ready");
 
-  // 1) Preprocess (แบบเรียบง่ายเหมือนเดิม แต่ robust ขึ้นเล็กน้อย)
-  const resized = await sharp(imageBuffer, { limitInputPixels: false })
-    .rotate() // เคารพ EXIF
+  // อ่าน/ปรับขนาด (cover) + เคารพ EXIF
+  const basePNG = await sharp(imageBuffer, { limitInputPixels: false })
+    .rotate()
     .resize(INPUT_SIZE, INPUT_SIZE, { fit: "cover" })
     .toFormat("png")
     .toBuffer();
 
-  // decode -> float32 -> (หาร 255 เฉพาะถ้าโมเดล *ไม่มี* Rescaling)
-  let x = tf.node.decodeImage(resized, 3).toFloat().expandDims(0);
-  if (!MODEL_INCLUDES_RESCALE) x = x.div(255);
+  // x0 : ภาพปกติ
+  let x0 = tf.node.decodeImage(basePNG, 3).toFloat().expandDims(0);
+  if (!MODEL_INCLUDES_RESCALE) x0 = x0.div(255);
 
-  // 2) Predict (รองรับทั้ง Graph & Layers)
-  let y = model.predict ? model.predict(x) : null;
+  // x1 : กลับซ้าย–ขวา
+  let x1 = tf.image.flipLeftRight(x0);
+
+  // x2 : เพิ่มคอนทราสต์เล็กน้อย (บนสเกล 0..255)
+  let x2 = tf.image.adjustContrast(x0, 1.12);
+  x2 = tf.clipByValue(x2, 0, 255);
+
+  // รวมเป็น batch 3 ภาพ
+  const xb = tf.concat([x0, x1, x2], 0);
+
+  let y = model.predict ? model.predict(xb) : null;
   if (Array.isArray(y)) y = y[0];
   if (!y || typeof y.dataSync !== "function") {
     try {
       const feedName  = model.inputs?.[0]?.name;
       const fetchName = model.outputs?.[0]?.name;
-      y = model.execute(feedName ? { [feedName]: x } : x, fetchName);
+      y = model.execute(feedName ? { [feedName]: xb } : xb, fetchName);
     } catch (e) {
-      tf.dispose(x);
+      tf.dispose([x0, x1, x2, xb]);
       throw e;
     }
   }
 
-  // 3) Post-process -> probs
-  let probs = Array.from(y.dataSync());
-  const sum = probs.reduce((a, b) => a + b, 0);
-  if (!Number.isFinite(sum) || Math.abs(sum - 1) > 1e-3 || probs.some(v => v < 0) || probs.some(v => v > 1)) {
-    probs = softmax(probs);
+  // y: [3, C] → average (logits หรือ probs ก็รองรับ)
+  const raw = y.arraySync(); // [[...C], [...], [...]]
+  let probsAvg = Array(raw[0].length).fill(0);
+  for (let i = 0; i < raw.length; i++) {
+    const vec = raw[i];
+    const needSoftmax = (Math.abs(vec.reduce((a,b)=>a+b,0) - 1) > 1e-3) || vec.some(v => v < 0) || vec.some(v => v > 1);
+    const p = needSoftmax ? softmax(vec) : vec.slice();
+    for (let c = 0; c < p.length; c++) probsAvg[c] += p[c];
+  }
+  probsAvg = probsAvg.map(v => v / raw.length);
+
+  // ---- default calibration (ถ้าไม่ได้ตั้ง ENV) ----
+  if (!Object.keys(CALIB_WEIGHTS).length) {
+    CALIB_WEIGHTS = { Eczema: 1.55, Shingles: 1.45 };
+  }
+  if (!Object.keys(PER_CLASS_THRESHOLDS).length) {
+    PER_CLASS_THRESHOLDS = { Eczema: 0.48, Shingles: 0.48 };
   }
 
-  // 4) (ใหม่) คาลิเบรตเฉพาะคลาสที่เพี้ยน เช่น Eczema, Shingles
-  probs = applyCalibration(probs, labels, CALIB_WEIGHTS);
+  // 1) คาลิเบรตเฉพาะคลาส (เช่น Eczema/Shingles)
+  probsAvg = applyCalibration(probsAvg, labels, CALIB_WEIGHTS);
 
-  // 5) sharpen ให้ top-1 มั่นใจกว่าเดิมเล็กน้อย (ไม่โอเวอร์)
-  probs = sharpen(probs, PROB_SHARPEN_GAMMA);
+  // 2) sharpen ให้ top-1 มั่นใจขึ้นแบบพอดี
+  probsAvg = sharpen(probsAvg, PROB_SHARPEN_GAMMA);
 
-  // 6) Unknown policy
-  const { bestIdx, bestProb, secondProb } = top2(probs);
-  const ent = entropy(probs);
+  // 3) Unknown policy (รองรับ per-class threshold)
+  const { bestIdx, bestProb, secondProb } = top2(probsAvg);
+  const ent = entropy(probsAvg);
 
-  // per-class threshold (ถ้าตั้งมาใน ENV) เช่น Eczema:0.48, Shingles:0.48
   const bestName = labels[bestIdx] || "";
   const thrClass = Number.isFinite(PER_CLASS_THRESHOLDS[bestName])
     ? PER_CLASS_THRESHOLDS[bestName]
@@ -208,16 +218,16 @@ async function classifyImage(imageBuffer, { debug = false } = {}) {
   const score = Number((bestProb * 100).toFixed(2));
 
   if (debug) {
-    console.log("[DEBUG] probs:", probs.map(v => v.toFixed(4)));
+    console.log("[DEBUG] probs:", probsAvg.map(v => v.toFixed(4)));
     console.log(`[DEBUG] best=${bestName} p=${bestProb.toFixed(4)} second=${secondProb.toFixed(4)} H=${ent.toFixed(4)} thr=${thrClass}`);
     console.log(`[DEBUG] unknown=${isUnknown}`);
   }
 
-  tf.dispose([x, y]);
+  tf.dispose([x0, x1, x2, xb, y]);
   return { label, score, appliedUnknown: isUnknown };
 }
 
-// ===== 3) Webhook =====
+// ======= Webhook =======
 app.post("/webhook", async (req, res) => {
   const events = req.body?.events || [];
   for (const event of events) {
@@ -230,7 +240,6 @@ app.post("/webhook", async (req, res) => {
 
       if (event.type === "message" && event.message.type === "image") {
         const imageId = event.message.id;
-
         const imgResp = await axios.get(
           `https://api-data.line.me/v2/bot/message/${imageId}/content`,
           {
@@ -252,7 +261,6 @@ app.post("/webhook", async (req, res) => {
         await replyMessage(replyToken, "ยังรองรับเฉพาะรูปภาพและข้อความนะคะ");
       }
     } catch (err) {
-      // เก็บรายละเอียดไว้ใน log แต่ตอบผู้ใช้สั้นๆ
       console.error("[Webhook error]", err?.stack || err?.message || err);
       await replyMessage(replyToken, "เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้งค่ะ");
     }
@@ -260,7 +268,7 @@ app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 });
 
-// ===== 4) Health & Debug =====
+// ======= Health & Debug =======
 app.get("/", (_req, res) => res.send("Webhook is working!"));
 app.get("/healthz", (_req, res) =>
   res.json({
@@ -275,5 +283,15 @@ app.get("/healthz", (_req, res) =>
     inputSize: INPUT_SIZE
   })
 );
+
+app.post("/debug/classify", express.raw({ type: "*/*", limit: "10mb" }), async (req, res) => {
+  try {
+    const out = await classifyImage(req.body, { debug: true });
+    res.json(out);
+  } catch (e) {
+    console.error("[debug/classify]", e?.stack || e?.message || e);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
