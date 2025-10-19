@@ -1,4 +1,4 @@
-// ---- ลด log จาก TensorFlow (ต้องมาก่อน require tf) ----
+// ---- ลด log TF (ต้องมาก่อน tf) ----
 process.env.TF_CPP_MIN_LOG_LEVEL = process.env.TF_CPP_MIN_LOG_LEVEL || "2";
 
 require("dotenv").config();
@@ -10,7 +10,6 @@ const sharp = require("sharp");
 const fs = require("fs");
 const path = require("path");
 
-// ทำให้ sharp เสถียรบน Render
 sharp.cache(true);
 sharp.concurrency(1);
 
@@ -18,18 +17,22 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 
-// ===== Config (ค่าที่ปรับแล้ว) =====
+// ===== Config (ปรับเพื่อเพิ่มความมั่นใจ) =====
 const INPUT_SIZE = Number(process.env.INPUT_SIZE || 300);
-const MODEL_INCLUDES_RESCALE = true; // โมเดลมี Rescaling(1./255) อยู่แล้ว
+// โมเดลของเดียร์ build พร้อม Rescaling(1./255) แล้ว -> ไม่ต้องหาร 255 ซ้ำ
+const MODEL_INCLUDES_RESCALE = true;
 
-// 👇 ปรับ threshold ตามข้อเสนอ
-const UNKNOWN_THRESHOLD = 0.4;   // เดิม 0.5
-const MARGIN_THRESHOLD  = 0.07;  // เดิม 0.05
-const ENTROPY_THRESHOLD = 1.6;   // คงเดิม
-const SOFTMAX_TEMP      = 1.0;
+// Unknown policy (สมดุลขึ้น)
+const UNKNOWN_THRESHOLD = Number(process.env.UNKNOWN_THRESHOLD || 0.50);
+const MARGIN_THRESHOLD  = Number(process.env.MARGIN_THRESHOLD  || 0.06);
+const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 1.50);
+
+// Sharpen ความน่าจะเป็นหลัง softmax เพื่อยกความมั่นใจ top-1
+// gamma > 1 = คมขึ้น (แต่ไม่โอเวอร์)
+const PROB_SHARPEN_GAMMA = Number(process.env.PROB_SHARPEN_GAMMA || 1.35);
 
 // ===== 1) โหลด labels + model =====
-const MODEL_DIR = path.join(__dirname, "model");
+const MODEL_DIR  = path.join(__dirname, "model");
 const MODEL_PATH = `file://${path.join(MODEL_DIR, "model.json")}`;
 const LABELS_PATH = path.join(__dirname, "class_names.json");
 
@@ -43,10 +46,7 @@ try {
   labels = ["ClassA", "ClassB", "Unknown"];
 }
 
-let model = null;
-let modelReady = false;
-let modelType = "unknown";
-
+let model = null, modelReady = false, modelType = "unknown";
 (async () => {
   try {
     try {
@@ -67,7 +67,7 @@ let modelType = "unknown";
 
 app.use(bodyParser.json());
 
-// ===== 2) Helper: ตอบกลับ LINE =====
+// ===== Helper: ตอบ LINE =====
 async function replyMessage(replyToken, text) {
   try {
     await axios.post(
@@ -95,31 +95,36 @@ function top2(ps) {
   }
   return { bestIdx: b[0], bestProb: b[1], secondIdx: s[0], secondProb: s[1] };
 }
-function softmaxTemp(arr, t=1) {
-  const a = Array.from(arr, v => v / t);
-  const m = Math.max(...a);
-  const exps = a.map(v => Math.exp(v - m));
-  const sum = exps.reduce((p, c) => p + c, 0);
-  return exps.map(v => v / sum);
+// ยกกำลังแล้ว normalize (sharpen)
+function sharpenProbs(probs, gamma) {
+  const raised = probs.map(p => Math.pow(Math.max(p, 1e-12), gamma));
+  const s = raised.reduce((a, b) => a + b, 0);
+  return raised.map(v => v / s);
+}
+// softmax ป้องกันกรณี output ยังเป็น logits
+function softmax(arr) {
+  const m = Math.max(...arr);
+  const exps = arr.map(v => Math.exp(v - m));
+  const s = exps.reduce((a, b) => a + b, 0);
+  return exps.map(v => v / s);
 }
 
-// ===== 3) Preprocess + Predict =====
+// ===== 3) Preprocess + Predict + Unknown policy =====
 async function classifyImage(imageBuffer, { debug = false } = {}) {
   if (!modelReady) throw new Error("Model not ready");
 
+  // resize แบบ cover (crop ตรงกลาง) ให้คงสัดส่วน
   const resized = await sharp(imageBuffer, { limitInputPixels: false })
     .resize(INPUT_SIZE, INPUT_SIZE, { fit: "cover" })
     .toFormat("png")
     .toBuffer();
 
   let x = tf.node.decodeImage(resized, 3).toFloat().expandDims(0);
-  if (!MODEL_INCLUDES_RESCALE) {
-    x = x.div(255);
-  }
+  if (!MODEL_INCLUDES_RESCALE) x = x.div(255);
 
+  // predict รองรับทั้ง Graph/Layers
   let y = model.predict ? model.predict(x) : null;
   if (Array.isArray(y)) y = y[0];
-
   if (!y || typeof y.dataSync !== "function") {
     try {
       const feedName  = model.inputs?.[0]?.name;
@@ -131,20 +136,24 @@ async function classifyImage(imageBuffer, { debug = false } = {}) {
     }
   }
 
-  const raw = y.dataSync();
-  let probs = Array.from(raw);
-  const sum = probs.reduce((p, c) => p + c, 0);
-  if (Math.abs(sum - 1) > 1e-3) probs = softmaxTemp(raw, SOFTMAX_TEMP);
+  // แปลงผล
+  const raw = Array.from(y.dataSync());
+  // ถ้าผลรวมไม่ได้ ~1 → ถือว่า logits → softmax ก่อน
+  const sum = raw.reduce((p, c) => p + c, 0);
+  let probs = (Math.abs(sum - 1) > 1e-3) ? softmax(raw) : raw;
+
+  // ปรับคมความน่าจะเป็น (เพิ่มค่ามั่นใจอย่างมีวินัย)
+  probs = sharpenProbs(probs, PROB_SHARPEN_GAMMA);
 
   const { bestIdx, bestProb, secondProb } = top2(probs);
   const ent = entropy(probs);
 
-  const unknown =
+  const isUnknown =
     (bestProb < UNKNOWN_THRESHOLD) ||
     (bestProb - secondProb < MARGIN_THRESHOLD) ||
     (ent > ENTROPY_THRESHOLD);
 
-  const idx = unknown ? (labels.length - 1) : bestIdx;
+  const idx = isUnknown ? (labels.length - 1) : bestIdx;
   const label = labels[idx] || "ไม่สามารถจำแนกได้";
   const score = Number((bestProb * 100).toFixed(2));
 
@@ -154,7 +163,7 @@ async function classifyImage(imageBuffer, { debug = false } = {}) {
   }
 
   tf.dispose([x, y]);
-  return { label, score, appliedUnknown: unknown };
+  return { label, score, appliedUnknown: isUnknown };
 }
 
 // ===== 4) Webhook =====
@@ -203,7 +212,17 @@ app.get("/", (_req, res) => res.send("Webhook is working!"));
 app.get("/healthz", (_req, res) => res.json({
   ok: true, modelReady, modelType,
   nLabels: labels.length,
-  thresholds: { UNKNOWN_THRESHOLD, MARGIN_THRESHOLD, ENTROPY_THRESHOLD }
+  thresholds: { UNKNOWN_THRESHOLD, MARGIN_THRESHOLD, ENTROPY_THRESHOLD, PROB_SHARPEN_GAMMA }
 }));
+
+// debug endpoint ส่งไฟล์ดิบมาทดสอบ
+app.post("/debug/classify", express.raw({ type: "*/*", limit: "10mb" }), async (req, res) => {
+  try {
+    const out = await classifyImage(req.body, { debug: true });
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
