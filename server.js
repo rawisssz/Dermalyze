@@ -20,6 +20,14 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 
+// ===== Rich menu keywords =====
+const START_QUIZ_KEYWORD =
+  process.env.START_QUIZ_KEYWORD || "เริ่มทำแบบประเมิน";
+const USER_GUIDE_KEYWORD =
+  process.env.USER_GUIDE_KEYWORD || "คู่มือการใช้งาน";
+const OUTBREAK_KEYWORD =
+  process.env.OUTBREAK_KEYWORD || "โรคผิวหนังที่กำลังระบาด";
+
 // ====== CONFIG (มีค่า default ในตัว ไม่ต้องตั้ง ENV ก็ได้) ======
 const INPUT_SIZE = Number(process.env.INPUT_SIZE || 300);
 
@@ -29,10 +37,12 @@ const MODEL_INCLUDES_RESCALE = true;
 // Unknown policy
 const UNKNOWN_THRESHOLD = Number(process.env.UNKNOWN_THRESHOLD || 0.55);
 const MARGIN_THRESHOLD = Number(process.env.MARGIN_THRESHOLD || 0.08);
-const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 1.60);
+const ENTROPY_THRESHOLD = Number(process.env.ENTROPY_THRESHOLD || 1.6);
 
 // ทำ prob ให้คมขึ้นนิดหน่อย (เพิ่มความมั่นใจ top-1 แบบไม่โอเวอร์)
-const PROB_SHARPEN_GAMMA = Number(process.env.PROB_SHARPEN_GAMMA || 1.36);
+const PROB_SHARPEN_GAMMA = Number(
+  process.env.PROB_SHARPEN_GAMMA || 1.36
+);
 
 // per-class calibration (ดัน Eczema/Shingles ให้เด่นขึ้น)
 function parseDictEnv(text) {
@@ -273,10 +283,16 @@ const diseaseThToEntity = {
 };
 
 // ===== URL รูปที่ใช้ในเมนู C / E =====
+// ถ้าใน env เป็นลิงก์ /file/d/.../view ก็ใช้ได้ แต่ default จะเป็น uc?export=view
 const IMAGE_MANUAL_URL =
-  process.env.IMAGE_MANUAL_URL || "https://drive.google.com/file/d/1w0jWsKehSFiSGTq59sPzkWcChBbMwyQT/view?usp=sharing";
+  process.env.USER_GUIDE_IMAGE_URL ||
+  process.env.IMAGE_MANUAL_URL ||
+  "https://drive.google.com/uc?export=view&id=1w0jWsKehSFiSGTq59sPzkWcChBbMwyQT";
+
 const IMAGE_TREND_URL =
-  process.env.IMAGE_TREND_URL || "https://drive.google.com/file/d/15dvR47R8pfAj5ToJ2ehGDULKnEs2H9W8/view?usp=sharing";
+  process.env.OUTBREAK_IMAGE_URL ||
+  process.env.IMAGE_TREND_URL ||
+  "https://drive.google.com/uc?export=view&id=15dvR47R8pfAj5ToJ2ehGDULKnEs2H9W8";
 
 // ====== โหลด labels + model ======
 const MODEL_DIR = path.join(__dirname, "model");
@@ -319,7 +335,15 @@ app.use(bodyParser.json());
 
 // ===== Helper: ตอบ LINE =====
 async function replyMessage(replyToken, messages) {
-  const msgs = Array.isArray(messages) ? messages : [{ type: "text", text: String(messages) }];
+  let msgs;
+
+  if (Array.isArray(messages)) {
+    msgs = messages;
+  } else if (messages && typeof messages === "object" && messages.type) {
+    msgs = [messages];
+  } else {
+    msgs = [{ type: "text", text: String(messages) }];
+  }
 
   try {
     await axios.post(
@@ -445,9 +469,9 @@ async function classifyImage(imageBuffer, { debug = false } = {}) {
       .map((o) => `${labels[o.i]}:${(o.p * 100).toFixed(1)}%`)
       .join(", ");
     console.log(
-      `[DEBUG] top3 = ${top3} | H=${ent.toFixed(3)} | margin=${(bestProb - secondProb).toFixed(
-        3
-      )}`
+      `[DEBUG] top3 = ${top3} | H=${ent.toFixed(3)} | margin=${(
+        bestProb - secondProb
+      ).toFixed(3)}`
     );
   }
 
@@ -460,8 +484,8 @@ const DIALOGFLOW_PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID;
 let dfSessionsClient = null;
 
 if (DIALOGFLOW_PROJECT_ID) {
-  // ถ้ามี GOOGLE_CREDS_JSON ให้ใช้เป็น credentials
-  const dfOptions = {};
+  const dfOptions = { projectId: DIALOGFLOW_PROJECT_ID };
+
   if (process.env.GOOGLE_CREDS_JSON) {
     dfOptions.credentials = JSON.parse(process.env.GOOGLE_CREDS_JSON);
   }
@@ -469,12 +493,15 @@ if (DIALOGFLOW_PROJECT_ID) {
   dfSessionsClient = new dialogflow.SessionsClient(dfOptions);
 }
 
-
 async function detectIntent(sessionId, text) {
   if (!dfSessionsClient || !DIALOGFLOW_PROJECT_ID) {
     throw new Error("Dialogflow not configured");
   }
-  const sessionPath = dfSessionsClient.projectAgentSessionPath(DIALOGFLOW_PROJECT_ID, sessionId);
+
+  const sessionPath = dfSessionsClient.projectAgentSessionPath(
+    DIALOGFLOW_PROJECT_ID,
+    sessionId
+  );
 
   const request = {
     session: sessionPath,
@@ -491,19 +518,27 @@ async function detectIntent(sessionId, text) {
 }
 
 // ===== Google Sheets Setup =====
-const QUESTIONS_SHEET_ID = process.env.QUESTIONS_SHEET_ID || process.env.SHEETS_ID;
-const QUESTIONS_RANGE = process.env.QUESTIONS_RANGE || "derma_questions!A1:Z1000";
+const QUESTIONS_SHEET_ID =
+  process.env.QUESTIONS_SHEET_ID || process.env.SHEETS_ID;
+const QUESTIONS_RANGE =
+  process.env.QUESTIONS_RANGE || "derma_questions!A1:Z1000";
 
 const RULES_SHEET_ID = process.env.RULES_SHEET_ID || process.env.RULES_ID;
-const RULES_RANGE = process.env.RULES_RANGE || "rules!A1:D500";
+const RULES_RANGE = process.env.RULES_RANGE || "Rules!A1:D1000";
 
 let sheetsApi = null;
 async function getSheetsApi() {
   if (sheetsApi) return sheetsApi;
-  const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_CREDS_JSON),
-  scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
-});
+
+  const options = {
+    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+  };
+
+  if (process.env.GOOGLE_CREDS_JSON) {
+    options.credentials = JSON.parse(process.env.GOOGLE_CREDS_JSON);
+  }
+
+  const auth = new google.auth.GoogleAuth(options);
   sheetsApi = google.sheets({ version: "v4", auth });
   return sheetsApi;
 }
@@ -657,7 +692,10 @@ function buildQuestionMessages(qIndex, total, q) {
 async function startQuizForUser(userId, replyToken) {
   const questions = await loadQuestions();
   if (!questions.length) {
-    await replyMessage(replyToken, "ขออภัย ระบบยังไม่มีคำถามให้ทำแบบประเมินค่ะ");
+    await replyMessage(
+      replyToken,
+      "ขออภัย ระบบยังไม่มีคำถามให้ทำแบบประเมินค่ะ"
+    );
     return;
   }
 
@@ -669,7 +707,10 @@ async function startQuizForUser(userId, replyToken) {
   });
 
   const firstQ = questions[0];
-  await replyMessage(replyToken, buildQuestionMessages(0, questions.length, firstQ));
+  await replyMessage(
+    replyToken,
+    buildQuestionMessages(0, questions.length, firstQ)
+  );
 }
 
 async function handleQuizAnswer(userId, replyToken, userText) {
@@ -688,7 +729,8 @@ async function handleQuizAnswer(userId, replyToken, userText) {
   const num = parseInt(userText.trim(), 10);
   if (Number.isNaN(num) || num < 1 || num > q.options.length) {
     const msgs = buildQuestionMessages(state.currentIndex, total, q);
-    msgs[0].text = "กรุณาเลือกคำตอบจากปุ่มด้านล่างนะคะ 😊\n\n" + msgs[0].text;
+    msgs[0].text =
+      "กรุณาเลือกคำตอบจากปุ่มด้านล่างนะคะ 😊\n\n" + msgs[0].text;
     await replyMessage(replyToken, msgs);
     return;
   }
@@ -701,14 +743,19 @@ async function handleQuizAnswer(userId, replyToken, userText) {
   if (state.currentIndex + 1 < total) {
     state.currentIndex += 1;
     const nextQ = state.questions[state.currentIndex];
-    await replyMessage(replyToken, buildQuestionMessages(state.currentIndex, total, nextQ));
+    await replyMessage(
+      replyToken,
+      buildQuestionMessages(state.currentIndex, total, nextQ)
+    );
   } else {
     state.inProgress = false;
 
-    const { bestDiseaseEntity, bestScore } = await calculateDiseaseFromRules(state.answers);
+    const { bestDiseaseEntity, bestScore } =
+      await calculateDiseaseFromRules(state.answers);
 
     const thName = diseaseEntityToTh[bestDiseaseEntity] || bestDiseaseEntity;
-    const infoObj = diseaseInfo[bestDiseaseEntity] || diseaseInfo.Unknown;
+    const infoObj =
+      diseaseInfo[bestDiseaseEntity] || diseaseInfo.Unknown;
 
     await replyMessage(replyToken, [
       {
@@ -736,7 +783,10 @@ app.post("/webhook", async (req, res) => {
         // ==== IMAGE ====
         if (event.message.type === "image") {
           if (!modelReady) {
-            await replyMessage(replyToken, "โมเดลกำลังโหลดอยู่ กรุณาลองอีกครั้งในไม่กี่วินาทีค่ะ");
+            await replyMessage(
+              replyToken,
+              "โมเดลกำลังโหลดอยู่ กรุณาลองอีกครั้งในไม่กี่วินาทีค่ะ"
+            );
             continue;
           }
 
@@ -765,9 +815,12 @@ app.post("/webhook", async (req, res) => {
           }
 
           try {
-            const { label, score, appliedUnknown } = await classifyImage(imgBuf, {
-              debug: false,
-            });
+            const { label, score, appliedUnknown } = await classifyImage(
+              imgBuf,
+              {
+                debug: false,
+              }
+            );
 
             const diseaseKey = diseaseInfo[label]
               ? label
@@ -776,9 +829,12 @@ app.post("/webhook", async (req, res) => {
               : "Unknown";
 
             const thName = diseaseEntityToTh[diseaseKey] || diseaseKey;
-            const infoObj = diseaseInfo[diseaseKey] || diseaseInfo.Unknown;
+            const infoObj =
+              diseaseInfo[diseaseKey] || diseaseInfo.Unknown;
 
-            const extra = appliedUnknown ? " (จัดเป็น Unknown/ไม่มั่นใจ)" : "";
+            const extra = appliedUnknown
+              ? " (จัดเป็น Unknown/ไม่มั่นใจ)"
+              : "";
 
             await replyMessage(replyToken, [
               {
@@ -786,7 +842,9 @@ app.post("/webhook", async (req, res) => {
                 text:
                   `ผลการจำแนกจากรูปภาพ:\n` +
                   `คาดว่าเป็น: ${thName}${extra}\n` +
-                  `ความเชื่อมั่นของโมเดล (class สูงสุด) ≈ ${score.toFixed(1)}%`,
+                  `ความเชื่อมั่นของโมเดล (class สูงสุด) ≈ ${score.toFixed(
+                    1
+                  )}%`,
               },
               { type: "text", text: infoObj.info },
               { type: "text", text: infoObj.care },
@@ -808,7 +866,7 @@ app.post("/webhook", async (req, res) => {
           const text = event.message.text.trim();
 
           // 1) ปุ่ม Rich menu ก่อน (กันชน Dialogflow)
-          if (text === "คู่มือการใช้งาน" || text === "คู่มือ Dermalyze") {
+          if (text === USER_GUIDE_KEYWORD || text === "คู่มือ Dermalyze") {
             await replyMessage(replyToken, {
               type: "image",
               originalContentUrl: IMAGE_MANUAL_URL,
@@ -817,7 +875,7 @@ app.post("/webhook", async (req, res) => {
             continue;
           }
 
-          if (text === "โรคผิวหนังที่กำลังระบาด" || text === "โรคที่กำลังระบาด") {
+          if (text === OUTBREAK_KEYWORD || text === "โรคที่กำลังระบาด") {
             await replyMessage(replyToken, {
               type: "image",
               originalContentUrl: IMAGE_TREND_URL,
@@ -828,8 +886,8 @@ app.post("/webhook", async (req, res) => {
 
           // 2) เริ่ม quiz จากปุ่มเมนู A
           if (
+            text === START_QUIZ_KEYWORD ||
             text === "เริ่มแบบประเมินผื่นผิวหนังนะคะ" ||
-            text === "เริ่มแบบประเมิน" ||
             text === "เริ่มทำแบบประเมินผิวหนัง" ||
             text === "เริ่มทำแบบประเมินผื่นผิวหนัง"
           ) {
@@ -860,24 +918,22 @@ app.post("/webhook", async (req, res) => {
             }
 
             if (diseaseParam && diseaseInfo[diseaseParam]) {
-              const thName = diseaseEntityToTh[diseaseParam] || diseaseParam;
+              const thName =
+                diseaseEntityToTh[diseaseParam] || diseaseParam;
               const infoObj = diseaseInfo[diseaseParam];
 
               const msgs = [
                 { type: "text", text: `ข้อมูลเกี่ยวกับ: ${thName}` },
               ];
 
-              // ส่ง info ตาม askType
               if (askType === "info" || askType === "both") {
                 msgs.push({ type: "text", text: infoObj.info });
               }
 
-              // ส่ง care ตาม askType
               if (askType === "care" || askType === "both") {
                 msgs.push({ type: "text", text: infoObj.care });
               }
 
-              // ปิดท้ายด้วย DISCLAIMER ทุกครั้งที่มีการให้คำแนะนำเกี่ยวกับโรค
               msgs.push({ type: "text", text: DISCLAIMER });
 
               await replyMessage(replyToken, msgs);
@@ -899,13 +955,22 @@ app.post("/webhook", async (req, res) => {
         }
 
         // type message อื่น ๆ
-        await replyMessage(replyToken, "ตอนนี้รองรับเฉพาะข้อความและรูปภาพนะคะ");
+        await replyMessage(
+          replyToken,
+          "ตอนนี้รองรับเฉพาะข้อความและรูปภาพนะคะ"
+        );
       } else {
-        await replyMessage(replyToken, "ยังรองรับเฉพาะข้อความและรูปภาพนะคะ");
+        await replyMessage(
+          replyToken,
+          "ยังรองรับเฉพาะข้อความและรูปภาพนะคะ"
+        );
       }
     } catch (err) {
       console.error("Webhook error:", err?.response?.data || err.message);
-      await replyMessage(replyToken, "เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้งค่ะ");
+      await replyMessage(
+        replyToken,
+        "เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้งค่ะ"
+      );
     }
   }
 
@@ -946,4 +1011,6 @@ app.post(
   }
 );
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`🚀 Server running on port ${PORT}`)
+);
