@@ -45,11 +45,11 @@ const OUTBREAK_KEYWORD =
 // ===== URL รูปที่ใช้ในเมนู C / E (ใช้ชื่อเดียวกับ ENV บน Render) =====
 const USER_GUIDE_IMAGE_URL =
   process.env.USER_GUIDE_IMAGE_URL ||
-  "https://drive.google.com/uc?export=view&id=1w0jWsKehSFiSGTq59sPzkWcChBbMwyQT";
+  "https://drive.google.com/uc?export=view&id=1w0jWsKehSFiSGTq59sPzkWcChBbMwyQT"
 
 const OUTBREAK_IMAGE_URL =
   process.env.OUTBREAK_IMAGE_URL ||
-  "https://drive.google.com/uc?export=view&id=15dvR47R8pfAj5ToJ2ehGDULKnEs2H9W8";
+  "https://drive.google.com/uc?export=view&id=15dvR47R8pfAj5ToJ2ehGDULKnEs2H9W8"
 
 // per-class calibration (ดัน Eczema/Shingles ให้เด่นขึ้น)
 function parseDictEnv(text) {
@@ -368,7 +368,7 @@ async function detectIntent(sessionId, text) {
 
 // ===== Google Sheets Setup =====
 const QUESTIONS_SHEET_ID = process.env.QUESTIONS_SHEET_ID || process.env.SHEETS_ID;
-const QUESTIONS_RANGE = process.env.QUESTIONS_RANGE || "derma_questions!A1:Z1000";
+const QUESTIONS_RANGE = process.env.QUESTIONS_RANGE || "derma_questions!A1:Z500";
 
 const RULES_SHEET_ID = process.env.RULES_SHEET_ID || process.env.RULES_ID;
 const RULES_RANGE = process.env.RULES_RANGE || "Rules!A1:D500";
