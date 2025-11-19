@@ -16,6 +16,7 @@ const { google } = require("googleapis");
 sharp.cache(true);
 sharp.concurrency(1);
 
+app.use("/static", express.static(path.join(__dirname, "public")));
 const app = express();
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
@@ -45,11 +46,10 @@ const OUTBREAK_KEYWORD =
 // ===== URL รูปที่ใช้ในเมนู C / E (ใช้ชื่อเดียวกับ ENV บน Render) =====
 const USER_GUIDE_IMAGE_URL =
   process.env.USER_GUIDE_IMAGE_URL ||
-  "https://drive.google.com/uc?export=view&id=1w0jWsKehSFiSGTq59sPzkWcChBbMwyQT"
-
+  "https://github.com/rawisssz/Dermalyze/blob/main/public/images/user_guide.png?raw=true";
 const OUTBREAK_IMAGE_URL =
   process.env.OUTBREAK_IMAGE_URL ||
-  "https://drive.google.com/uc?export=view&id=15dvR47R8pfAj5ToJ2ehGDULKnEs2H9W8"
+  "https://github.com/rawisssz/Dermalyze/blob/main/public/images/outbreak.jpg?raw=true";
 
 // per-class calibration (ดัน Eczema/Shingles ให้เด่นขึ้น)
 function parseDictEnv(text) {
@@ -510,25 +510,33 @@ const quizState = new Map();
 // quick reply ปุ่มคำตอบแต่ละข้อ
 function buildQuestionMessages(qIndex, total, q) {
   const header = `ข้อที่ ${qIndex + 1}/${total}\n${q.question}`;
+
+  // แสดงตัวเลือกแบบเต็มในข้อความหลัก
+  const optionLines = q.options
+    .map((opt, i) => `${i + 1}) ${opt}`)
+    .join("\n");
+
   const quickItems = q.options.map((opt, i) => ({
     type: "action",
     action: {
       type: "message",
-      label: `${i + 1}) ${opt}`,
-      text: `${i + 1}`, // ให้ผู้ใช้ส่งเลขกลับมา
+      // ใช้แค่เลขเป็น label ไม่เกิน 20 ตัวแน่นอน
+      label: String(i + 1),
+      text: String(i + 1), // ผู้ใช้กดแล้วส่งเลขกลับมา
     },
   }));
 
   return [
     {
       type: "text",
-      text: header,
+      text: `${header}\n\n${optionLines}`,
       quickReply: {
         items: quickItems,
       },
     },
   ];
 }
+
 
 async function startQuizForUser(userId, replyToken) {
   const questions = await loadQuestions();
@@ -691,10 +699,10 @@ app.post("/webhook", async (req, res) => {
 
           console.log("TEXT FROM USER:", JSON.stringify(text));
 
-          // 1) ปุ่ม Rich menu: คู่มือ
+          // 1) ปุ่ม Rich menu: คู่มือการใช้งาน
           if (
             normalizedText === USER_GUIDE_KEYWORD ||
-            normalizedText === "คู่มือ Dermalyze"
+            normalizedText === "คู่มือการใช้งาน"
           ) {
             await replyMessage(replyToken, {
               type: "image",
@@ -704,10 +712,10 @@ app.post("/webhook", async (req, res) => {
             continue;
           }
 
-          // 2) ปุ่ม Rich menu: โรคที่กำลังระบาด
+          // 2) ปุ่ม Rich menu: โรคผิวหนังที่กำลังระบาด
           if (
             normalizedText === OUTBREAK_KEYWORD ||
-            normalizedText === "โรคที่กำลังระบาด"
+            normalizedText === "โรคผิวหนังที่กำลังระบาด"
           ) {
             await replyMessage(replyToken, {
               type: "image",
