@@ -16,10 +16,12 @@ const { google } = require("googleapis");
 sharp.cache(true);
 sharp.concurrency(1);
 
-app.use("/static", express.static(path.join(__dirname, "public")));
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
+
+app.use("/static", express.static(path.join(__dirname, "public")));
 
 // ====== CONFIG (มีค่า default ในตัว ไม่ต้องตั้ง ENV ก็ได้) ======
 const INPUT_SIZE = Number(process.env.INPUT_SIZE || 300);
