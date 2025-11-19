@@ -17,3 +17,5 @@ Thumbs.db
 
 # Temp
 *.tmp
+"service-account.json" 
+service-account.json 
