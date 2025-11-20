@@ -934,18 +934,36 @@ app.post("/webhook", async (req, res) => {
                 // ไม่ต้องการทำแบบประเมิน
                 await replyMessage(replyToken, THANKYOU_MESSAGE);
               }
-            } else if (pending === "afterQuiz") {
+            }  else if (pending === "afterQuiz") {
               if (normalizedText === "ต้องการ") {
-                // ส่งลิงก์ค้นหาโรงพยาบาลใกล้ฉัน
-                await replyMessage(
-                  replyToken,
-                  {HOSPITAL_SEARCH_URL}
-                );
+                // ส่งปุ่มเปิดแผนที่ (template message) + ข้อความขอบคุณ แยกเป็น 2 bubble
+                await replyMessage(replyToken, [
+                  {
+                    type: "template",
+                    altText: "กดปุ่มเพื่อเปิดแผนที่โรงพยาบาลใกล้คุณ",
+                    template: {
+                      type: "buttons",
+                      text: "สามารถกดปุ่มด้านล่างเพื่อเปิดแผนที่โรงพยาบาลใกล้คุณได้เลยค่ะ",
+                      actions: [
+                        {
+                          type: "uri",
+                          label: "โรงพยาบาลใกล้ฉัน",
+                          uri: HOSPITAL_SEARCH_URL,
+                        },
+                      ],
+                    },
+                  },
+                  {
+                    type: "text",
+                    text: THANKYOU_MESSAGE,
+                  },
+                ]);
               } else {
-                // ไม่ต้องการค้นหาโรงพยาบาล
+                // ไม่ต้องการค้นหาโรงพยาบาล → ส่งข้อความขอบคุณอย่างเดียว
                 await replyMessage(replyToken, THANKYOU_MESSAGE);
               }
             }
+
             continue;
           }
 
