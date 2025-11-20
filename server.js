@@ -710,7 +710,7 @@ function buildQuestionMessages(qIndex, total, q) {
       },
     },
   ];
-}
+
 
 
 async function startQuizForUser(userId, replyToken) {
