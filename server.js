@@ -663,15 +663,15 @@ const quizState = new Map();
  */
 const nextActionState = new Map();
 
-// quick reply ปุ่มคำตอบแต่ละข้อ (ในแบบประเมิน)
+// quick reply ปุ่มคำตอบแต่ละข้อ (ในแบบประเมิน) → ปุ่มตัวเลขล้วน
 function buildQuestionMessages(qIndex, total, q) {
   const header = `ข้อที่ ${qIndex + 1}/${total}\n${q.question}`;
   const quickItems = q.options.map((opt, i) => ({
     type: "action",
     action: {
       type: "message",
-      label: `${i + 1}) ${opt}`,
-      text: `${i + 1}`, // ให้ผู้ใช้ส่งเลขกลับมา
+      label: `${i + 1}`,   // ❗ ปุ่มแสดงแค่ "1" / "2" / "3" ...
+      text: `${i + 1}`,    // ส่งกลับเป็นเลขเหมือนกัน
     },
   }));
 
