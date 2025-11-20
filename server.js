@@ -48,10 +48,10 @@ const OUTBREAK_KEYWORD =
 // ===== URL รูปที่ใช้ในเมนู C / E (ใช้ชื่อเดียวกับ ENV บน Render) =====
 const USER_GUIDE_IMAGE_URL =
   process.env.USER_GUIDE_IMAGE_URL ||
-  "https://github.com/rawisssz/Dermalyze/blob/main/public/images/user_guide.png?raw=true";
+  "https://dermalyze-4o1w.onrender.com/static/images/user_guide.png";
 const OUTBREAK_IMAGE_URL =
   process.env.OUTBREAK_IMAGE_URL ||
-  "https://github.com/rawisssz/Dermalyze/blob/main/public/images/outbreak.jpg?raw=true";
+  "https://dermalyze-4o1w.onrender.com/static/images/outbreak.jpg";
 
 // per-class calibration (ดัน Eczema/Shingles ให้เด่นขึ้น)
 function parseDictEnv(text) {
