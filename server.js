@@ -335,6 +335,7 @@ let modelType = "unknown";
 })();
 
 app.use(bodyParser.json());
+app.use("/static", express.static(path.join(__dirname, "public")));
 
 // ===== Helper: ตอบ LINE =====
 async function replyMessage(replyToken, messages) {
@@ -938,7 +939,7 @@ app.post("/webhook", async (req, res) => {
                 // ส่งลิงก์ค้นหาโรงพยาบาลใกล้ฉัน
                 await replyMessage(
                   replyToken,
-                  `สามารถค้นหาโรงพยาบาลใกล้คุณได้ที่ลิงก์นี้ค่ะ\n${HOSPITAL_SEARCH_URL}`
+                  `{HOSPITAL_SEARCH_URL}`
                 );
               } else {
                 // ไม่ต้องการค้นหาโรงพยาบาล
