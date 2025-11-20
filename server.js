@@ -45,11 +45,11 @@ const OUTBREAK_KEYWORD =
 // ===== URL รูปที่ใช้ในเมนู C / E (ใช้ชื่อเดียวกับ ENV บน Render) =====
 const USER_GUIDE_IMAGE_URL =
   process.env.USER_GUIDE_IMAGE_URL ||
-  "https://dermalyze-4o1w.onrender.com/static/images/user_guide.png";
+  "https://drive.google.com/uc?export=view&id=1w0jWsKehSFiSGTq59sPzkWcChBbMwyQT";
 
 const OUTBREAK_IMAGE_URL =
   process.env.OUTBREAK_IMAGE_URL ||
-  "https://dermalyze-4o1w.onrender.com/static/images/outbreak.jpg";
+  "https://drive.google.com/uc?export=view&id=15dvR47R8pfAj5ToJ2ehGDULKnEs2H9W8";
 
 // ===== ลิงก์ค้นหาโรงพยาบาลใกล้ฉัน =====
 const HOSPITAL_SEARCH_URL =
@@ -663,28 +663,34 @@ const quizState = new Map();
  */
 const nextActionState = new Map();
 
-// ✅ quick reply ปุ่มคำตอบแต่ละข้อ (ในแบบประเมิน) + แสดงช้อยส์ในข้อความ
+// quick reply ปุ่มคำตอบแต่ละข้อ (ในแบบประเมิน)
 function buildQuestionMessages(qIndex, total, q) {
-  const header = `ข้อที่ ${qIndex + 1}/${total}\n${q.question}`;
-
-  // แสดงตัวเลือกในข้อความหลัก
-  const optionLines = q.options
+  // เอาช้อยมาแปะในข้อความด้วย
+  const optionsText = q.options
     .map((opt, i) => `${i + 1}) ${opt}`)
     .join("\n");
+
+  const header =
+    `ข้อที่ ${qIndex + 1}/${total}\n` +
+    `${q.question}` +
+    (optionsText
+      ? `\n\nตัวเลือก:\n${optionsText}\n\n` +
+        `(กดปุ่มด้านล่าง หรือพิมพ์หมายเลขคำตอบ เช่น 1, 2, 3 ได้เลยค่ะ)`
+      : "");
 
   const quickItems = q.options.map((opt, i) => ({
     type: "action",
     action: {
       type: "message",
-      label: String(i + 1),   // label สั้น ๆ เป็นตัวเลข
-      text: String(i + 1),    // ส่งกลับเป็นเลขล้วน ๆ
+      label: `${i + 1}) ${opt}`,
+      text: `${i + 1}`, // ให้ผู้ใช้ส่งเลขกลับมา
     },
   }));
 
   return [
     {
       type: "text",
-      text: `${header}\n\n${optionLines}`,
+      text: header,
       quickReply: {
         items: quickItems,
       },
@@ -692,9 +698,9 @@ function buildQuestionMessages(qIndex, total, q) {
   ];
 }
 
+
 async function startQuizForUser(userId, replyToken) {
   const questions = await loadQuestions();
-
   if (!questions.length) {
     await replyMessage(replyToken, "ขออภัย ระบบยังไม่มีคำถามให้ทำแบบประเมินค่ะ");
     return;
