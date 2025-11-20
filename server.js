@@ -45,11 +45,11 @@ const OUTBREAK_KEYWORD =
 // ===== URL รูปที่ใช้ในเมนู C / E (ใช้ชื่อเดียวกับ ENV บน Render) =====
 const USER_GUIDE_IMAGE_URL =
   process.env.USER_GUIDE_IMAGE_URL ||
-  "https://drive.google.com/uc?export=view&id=1w0jWsKehSFiSGTq59sPzkWcChBbMwyQT";
+  "https://dermalyze-4o1w.onrender.com/static/images/user_guide.png";
 
 const OUTBREAK_IMAGE_URL =
   process.env.OUTBREAK_IMAGE_URL ||
-  "https://drive.google.com/uc?export=view&id=15dvR47R8pfAj5ToJ2ehGDULKnEs2H9W8";
+  "https://dermalyze-4o1w.onrender.com/static/images/outbreak.jpg";
 
 // ===== ลิงก์ค้นหาโรงพยาบาลใกล้ฉัน =====
 const HOSPITAL_SEARCH_URL =
