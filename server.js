@@ -663,7 +663,7 @@ const quizState = new Map();
  */
 const nextActionState = new Map();
 
-// quick reply ปุ่มคำตอบแต่ละข้อ (ในแบบประเมิน)
+
 // quick reply ปุ่มคำตอบแต่ละข้อ (ในแบบประเมิน)
 function buildQuestionMessages(qIndex, total, q) {
   // แปะช้อยในข้อความให้เห็นชัด ๆ
@@ -699,19 +699,6 @@ function buildQuestionMessages(qIndex, total, q) {
     },
   ];
 }
-
-
-  return [
-    {
-      type: "text",
-      text: header,
-      quickReply: {
-        items: quickItems,
-      },
-    },
-  ];
-
-
 
 async function startQuizForUser(userId, replyToken) {
   const questions = await loadQuestions();
