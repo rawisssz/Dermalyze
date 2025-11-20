@@ -16,12 +16,9 @@ const { google } = require("googleapis");
 sharp.cache(true);
 sharp.concurrency(1);
 
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
-
-app.use("/static", express.static(path.join(__dirname, "public")));
 
 // ====== CONFIG (มีค่า default ในตัว ไม่ต้องตั้ง ENV ก็ได้) ======
 const INPUT_SIZE = Number(process.env.INPUT_SIZE || 300);
@@ -48,10 +45,19 @@ const OUTBREAK_KEYWORD =
 // ===== URL รูปที่ใช้ในเมนู C / E (ใช้ชื่อเดียวกับ ENV บน Render) =====
 const USER_GUIDE_IMAGE_URL =
   process.env.USER_GUIDE_IMAGE_URL ||
-  "https://dermalyze-4o1w.onrender.com/static/images/user_guide.png";
+  "https://drive.google.com/uc?export=view&id=1w0jWsKehSFiSGTq59sPzkWcChBbMwyQT";
+
 const OUTBREAK_IMAGE_URL =
   process.env.OUTBREAK_IMAGE_URL ||
-  "https://dermalyze-4o1w.onrender.com/static/images/outbreak.jpg";
+  "https://drive.google.com/uc?export=view&id=15dvR47R8pfAj5ToJ2ehGDULKnEs2H9W8";
+
+// ===== ลิงก์ค้นหาโรงพยาบาลใกล้ฉัน =====
+const HOSPITAL_SEARCH_URL =
+  "https://www.google.co.th/maps/search/%E0%B9%82%E0%B8%A3%E0%B8%87%E0%B8%9E%E0%B8%A2%E0%B8%B2%E0%B8%9A%E0%B8%B2%E0%B8%A5%E0%B9%83%E0%B8%81%E0%B8%A5%E0%B9%89%E0%B8%89%E0%B8%B1%E0%B8%99";
+
+// ข้อความขอบคุณมาตรฐาน
+const THANKYOU_MESSAGE =
+  "ขอบคุณที่มาใช้บริการ Dermalyze ค่ะ\nยินดีช่วยเหลือเสมอนะคะ ขอให้หายไว ๆ ค่ะ 💜";
 
 // per-class calibration (ดัน Eczema/Shingles ให้เด่นขึ้น)
 function parseDictEnv(text) {
@@ -266,19 +272,27 @@ const diseaseThToEntity = {
   "สิว": "Acne",
   "สิวอุดตัน": "Acne",
   "สิวอักเสบ": "Acne",
+
   "ตุ่มน้ำพอง": "Bullous",
   "ตุ่มน้ำพองจากภูมิคุ้มกัน": "Bullous",
+
   "อีสุกอีใส": "Chickenpox",
   "สุกใส": "Chickenpox",
+
   "ผิวหนังอักเสบ": "Eczema",
   "ผิวหนังอักเสบเอ็กซีมา": "Eczema",
   "เอ็กซีมา": "Eczema",
+
   "สะเก็ดเงิน": "Psoriasis",
+
   "งูสวัด": "Shingles",
+
   "หูด": "Warts",
   "หูดฝ่าเท้า": "Warts",
+
   "ผิวปกติ": "NormalSkin",
   "ผิวไม่เป็นโรค": "NormalSkin",
+
   "ไม่สามารถระบุได้": "Unknown",
   "ไม่ทราบ": "Unknown",
 };
@@ -325,15 +339,12 @@ app.use(bodyParser.json());
 // ===== Helper: ตอบ LINE =====
 async function replyMessage(replyToken, messages) {
   let msgs;
-
   if (Array.isArray(messages)) {
-    // กรณีส่งมาเป็น array อยู่แล้ว
     msgs = messages;
   } else if (messages && typeof messages === "object" && messages.type) {
     // กรณีส่ง object เดียว เช่น { type: "image", ... }
     msgs = [messages];
   } else {
-    // กรณีเป็น string ธรรมดา
     msgs = [{ type: "text", text: String(messages) }];
   }
 
@@ -383,7 +394,7 @@ function sharpenProbs(probs, gamma) {
   return raised.map((v) => v / s);
 }
 
-// ===== Core: classify =====
+// ===== Core: classify (ห้ามแก้ logic เดิม) =====
 async function classifyImage(imageBuffer, { debug = false } = {}) {
   if (!modelReady) throw new Error("Model not ready");
 
@@ -508,7 +519,7 @@ async function detectIntent(sessionId, text) {
 
 // ===== Google Sheets Setup =====
 const QUESTIONS_SHEET_ID = process.env.QUESTIONS_SHEET_ID || process.env.SHEETS_ID;
-const QUESTIONS_RANGE = process.env.QUESTIONS_RANGE || "derma_questions!A1:Z500";
+const QUESTIONS_RANGE = process.env.QUESTIONS_RANGE || "derma_questions!A1:Z1000";
 
 const RULES_SHEET_ID = process.env.RULES_SHEET_ID || process.env.RULES_ID;
 const RULES_RANGE = process.env.RULES_RANGE || "Rules!A1:D500";
@@ -644,39 +655,36 @@ async function calculateDiseaseFromRules(answers) {
   return { bestDiseaseEntity, scores, bestScore };
 }
 
-// ===== Quiz state per user =====
+// ===== Quiz state & next-action state per user =====
 const quizState = new Map();
+/**
+ * nextActionState: map userId -> "afterImage" | "afterQuiz"
+ * ใช้จำว่าถ้าผู้ใช้ตอบ "ต้องการ"/"ไม่ต้องการ" จะไป flow ไหน
+ */
+const nextActionState = new Map();
 
-// quick reply ปุ่มคำตอบแต่ละข้อ
+// quick reply ปุ่มคำตอบแต่ละข้อ (ในแบบประเมิน)
 function buildQuestionMessages(qIndex, total, q) {
   const header = `ข้อที่ ${qIndex + 1}/${total}\n${q.question}`;
-
-  // แสดงตัวเลือกแบบเต็มในข้อความหลัก
-  const optionLines = q.options
-    .map((opt, i) => `${i + 1}) ${opt}`)
-    .join("\n");
-
   const quickItems = q.options.map((opt, i) => ({
     type: "action",
     action: {
       type: "message",
-      // ใช้แค่เลขเป็น label ไม่เกิน 20 ตัวแน่นอน
-      label: String(i + 1),
-      text: String(i + 1), // ผู้ใช้กดแล้วส่งเลขกลับมา
+      label: `${i + 1}) ${opt}`,
+      text: `${i + 1}`, // ให้ผู้ใช้ส่งเลขกลับมา
     },
   }));
 
   return [
     {
       type: "text",
-      text: `${header}\n\n${optionLines}`,
+      text: header,
       quickReply: {
         items: quickItems,
       },
     },
   ];
 }
-
 
 async function startQuizForUser(userId, replyToken) {
   const questions = await loadQuestions();
@@ -736,6 +744,7 @@ async function handleQuizAnswer(userId, replyToken, userText) {
     const thName = diseaseEntityToTh[bestDiseaseEntity] || bestDiseaseEntity;
     const infoObj = diseaseInfo[bestDiseaseEntity] || diseaseInfo.Unknown;
 
+    // ส่งสรุปผล + info + care + DISCLAIMER + ถามต่อเรื่องโรงพยาบาล
     await replyMessage(replyToken, [
       {
         type: "text",
@@ -746,7 +755,34 @@ async function handleQuizAnswer(userId, replyToken, userText) {
       { type: "text", text: infoObj.info },
       { type: "text", text: infoObj.care },
       { type: "text", text: DISCLAIMER },
+      {
+        type: "text",
+        text: "ต้องการค้นหาโรงพยาบาลใกล้คุณไหมคะ?",
+        quickReply: {
+          items: [
+            {
+              type: "action",
+              action: {
+                type: "message",
+                label: "ต้องการ",
+                text: "ต้องการ",
+              },
+            },
+            {
+              type: "action",
+              action: {
+                type: "message",
+                label: "ไม่ต้องการ",
+                text: "ไม่ต้องการ",
+              },
+            },
+          ],
+        },
+      },
     ]);
+
+    // ตั้ง state ว่าขั้นตอนถัดไปคือถามเรื่องโรงพยาบาล
+    nextActionState.set(userId, "afterQuiz");
   }
 }
 
@@ -809,6 +845,7 @@ app.post("/webhook", async (req, res) => {
 
             const extra = appliedUnknown ? " (จัดเป็น Unknown/ไม่มั่นใจ)" : "";
 
+            // ส่งผลรูป + info + care + DISCLAIMER + ถามต่อเรื่องแบบประเมิน
             await replyMessage(replyToken, [
               {
                 type: "text",
@@ -820,7 +857,34 @@ app.post("/webhook", async (req, res) => {
               { type: "text", text: infoObj.info },
               { type: "text", text: infoObj.care },
               { type: "text", text: DISCLAIMER },
+              {
+                type: "text",
+                text: "ต้องการทำแบบประเมินเพิ่มเติมเพื่อความมั่นใจไหมคะ?",
+                quickReply: {
+                  items: [
+                    {
+                      type: "action",
+                      action: {
+                        type: "message",
+                        label: "ต้องการ",
+                        text: "ต้องการ",
+                      },
+                    },
+                    {
+                      type: "action",
+                      action: {
+                        type: "message",
+                        label: "ไม่ต้องการ",
+                        text: "ไม่ต้องการ",
+                      },
+                    },
+                  ],
+                },
+              },
             ]);
+
+            // ตั้ง state ว่าขั้นต่อไปคือถามเรื่องแบบประเมิน
+            nextActionState.set(userId, "afterImage");
           } catch (e) {
             console.error("Classify error:", e.message);
             await replyMessage(
@@ -839,10 +903,41 @@ app.post("/webhook", async (req, res) => {
 
           console.log("TEXT FROM USER:", JSON.stringify(text));
 
-          // 1) ปุ่ม Rich menu: คู่มือการใช้งาน
+          // 0) ถ้ามี nextActionState (ต้องการ/ไม่ต้องการ) ให้จัดการก่อน Dialogflow
+          const pending = nextActionState.get(userId);
+          if (
+            pending &&
+            (normalizedText === "ต้องการ" || normalizedText === "ไม่ต้องการ")
+          ) {
+            nextActionState.delete(userId);
+
+            if (pending === "afterImage") {
+              if (normalizedText === "ต้องการ") {
+                // เริ่มทำแบบประเมิน
+                await startQuizForUser(userId, replyToken);
+              } else {
+                // ไม่ต้องการทำแบบประเมิน
+                await replyMessage(replyToken, THANKYOU_MESSAGE);
+              }
+            } else if (pending === "afterQuiz") {
+              if (normalizedText === "ต้องการ") {
+                // ส่งลิงก์ค้นหาโรงพยาบาลใกล้ฉัน
+                await replyMessage(
+                  replyToken,
+                  `สามารถค้นหาโรงพยาบาลใกล้คุณได้ที่ลิงก์นี้ค่ะ\n${HOSPITAL_SEARCH_URL}`
+                );
+              } else {
+                // ไม่ต้องการค้นหาโรงพยาบาล
+                await replyMessage(replyToken, THANKYOU_MESSAGE);
+              }
+            }
+            continue;
+          }
+
+          // 1) ปุ่ม Rich menu: คู่มือ
           if (
             normalizedText === USER_GUIDE_KEYWORD ||
-            normalizedText === "คู่มือการใช้งาน"
+            normalizedText === "คู่มือ Dermalyze"
           ) {
             await replyMessage(replyToken, {
               type: "image",
@@ -852,10 +947,10 @@ app.post("/webhook", async (req, res) => {
             continue;
           }
 
-          // 2) ปุ่ม Rich menu: โรคผิวหนังที่กำลังระบาด
+          // 2) ปุ่ม Rich menu: โรคที่กำลังระบาด
           if (
             normalizedText === OUTBREAK_KEYWORD ||
-            normalizedText === "โรคผิวหนังที่กำลังระบาด"
+            normalizedText === "โรคที่กำลังระบาด"
           ) {
             await replyMessage(replyToken, {
               type: "image",
@@ -865,7 +960,16 @@ app.post("/webhook", async (req, res) => {
             continue;
           }
 
-          // 3) เริ่ม quiz จากปุ่มเมนู A
+          // 3) ข้อความแนะนำจากเมนู: "พิมพ์เพื่อสอบถามข้อมูล/การดูแลโรคผิวหนังเบื้องต้น"
+          if (normalizedText === "พิมพ์เพื่อสอบถามข้อมูล/การดูแลโรคผิวหนังเบื้องต้น") {
+            await replyMessage(
+              replyToken,
+              "คุณสามารถพิมพ์ชื่อโรคผิวหนังเพื่อสอบถามข้อมูล/การดูแลเบื้องต้นได้ค่ะ เช่น:\n• สิว\n• ผิวหนังอักเสบ (เอ็กซีมา)\n• งูสวัด\n• สะเก็ดเงิน\nเป็นต้นค่ะ 😊"
+            );
+            continue;
+          }
+
+          // 4) เริ่ม quiz จากปุ่มเมนู A
           if (
             normalizedText === START_QUIZ_KEYWORD ||
             normalizedText === "เริ่มแบบประเมิน" ||
@@ -876,32 +980,12 @@ app.post("/webhook", async (req, res) => {
             continue;
           }
 
-          // 4) ถ้ากำลังทำ quiz อยู่ → ตีความข้อความเป็นคำตอบ (เลขจากปุ่ม quick reply)
+          // 5) ถ้ากำลังทำ quiz อยู่ → ตีความข้อความเป็นคำตอบ (เลขจากปุ่ม quick reply)
           const state = quizState.get(userId);
           if (state && state.inProgress) {
             await handleQuizAnswer(userId, replyToken, normalizedText);
             continue;
           }
-
-          // 5) ถามข้อมูลทั่วไป → แสดงโรคที่ถามได้ (ไม่เข้า Dialogflow)
-if (
-  normalizedText === "พิมพ์เพื่อสอบถามข้อมูล/การดูแลโรคผิวหนังเบื้องต้น" ||
-  normalizedText === "สอบถามข้อมูลโรคผิวหนัง" ||
-  normalizedText === "ข้อมูลโรคผิวหนัง"
-) {
-  await replyMessage(replyToken, {
-    type: "text",
-    text:
-      "คุณสามารถพิมพ์ชื่อโรคผิวหนังเพื่อดูข้อมูลและการดูแลเบื้องต้นได้นะคะ 😊\n\n" +
-      "ตัวอย่างเช่น:\n" +
-      "• สิว\n" +
-      "• ผิวหนังอักเสบ (เอ็กซีมา)\n" +
-      "• งูสวัด\n" +
-      "• สะเก็ดเงิน\n\n" +
-      "...หรือโรคอื่น ๆ ที่สนใจได้เลยค่ะ",
-  });
-  continue;
-}
 
           // 6) ถามตอบทั่วไป → ส่งเข้า Dialogflow
           try {
