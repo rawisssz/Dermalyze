@@ -663,22 +663,28 @@ const quizState = new Map();
  */
 const nextActionState = new Map();
 
-// quick reply ปุ่มคำตอบแต่ละข้อ (ในแบบประเมิน)
+// ✅ quick reply ปุ่มคำตอบแต่ละข้อ (ในแบบประเมิน) + แสดงช้อยส์ในข้อความ
 function buildQuestionMessages(qIndex, total, q) {
   const header = `ข้อที่ ${qIndex + 1}/${total}\n${q.question}`;
+
+  // แสดงตัวเลือกในข้อความหลัก
+  const optionLines = q.options
+    .map((opt, i) => `${i + 1}) ${opt}`)
+    .join("\n");
+
   const quickItems = q.options.map((opt, i) => ({
     type: "action",
     action: {
       type: "message",
-      label: `${i + 1}) ${opt}`,
-      text: `${i + 1}`, // ให้ผู้ใช้ส่งเลขกลับมา
+      label: String(i + 1),   // label สั้น ๆ เป็นตัวเลข
+      text: String(i + 1),    // ส่งกลับเป็นเลขล้วน ๆ
     },
   }));
 
   return [
     {
       type: "text",
-      text: header,
+      text: `${header}\n\n${optionLines}`,
       quickReply: {
         items: quickItems,
       },
@@ -688,6 +694,7 @@ function buildQuestionMessages(qIndex, total, q) {
 
 async function startQuizForUser(userId, replyToken) {
   const questions = await loadQuestions();
+
   if (!questions.length) {
     await replyMessage(replyToken, "ขออภัย ระบบยังไม่มีคำถามให้ทำแบบประเมินค่ะ");
     return;
