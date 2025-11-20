@@ -939,7 +939,7 @@ app.post("/webhook", async (req, res) => {
                 // ส่งลิงก์ค้นหาโรงพยาบาลใกล้ฉัน
                 await replyMessage(
                   replyToken,
-                  `{HOSPITAL_SEARCH_URL}`
+                  {HOSPITAL_SEARCH_URL}
                 );
               } else {
                 // ไม่ต้องการค้นหาโรงพยาบาล
