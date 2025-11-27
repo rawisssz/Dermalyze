@@ -911,19 +911,46 @@ app.post("/webhook", async (req, res) => {
             pending &&
             (normalizedText === "ต้องการ" || normalizedText === "ไม่ต้องการ")
           ) {
+            // เคลียร์ state เดิมก่อน
             nextActionState.delete(userId);
 
             if (pending === "afterImage") {
               if (normalizedText === "ต้องการ") {
-                // เริ่มทำแบบประเมิน
+                // ผู้ใช้ต้องการทำแบบประเมิน → เริ่ม quiz
                 await startQuizForUser(userId, replyToken);
               } else {
-                // ไม่ต้องการทำแบบประเมิน
-                await replyMessage(replyToken, THANKYOU_MESSAGE);
+                // ผู้ใช้ไม่ต้องการทำแบบประเมิน → ถามต่อเรื่องโรงพยาบาล
+                await replyMessage(replyToken, {
+                  type: "text",
+                  text: "ต้องการค้นหาโรงพยาบาลใกล้คุณไหมคะ?",
+                  quickReply: {
+                    items: [
+                      {
+                        type: "action",
+                        action: {
+                          type: "message",
+                          label: "ต้องการ",
+                          text: "ต้องการ",
+                        },
+                      },
+                      {
+                        type: "action",
+                        action: {
+                          type: "message",
+                          label: "ไม่ต้องการ",
+                          text: "ไม่ต้องการ",
+                        },
+                      },
+                    ],
+                  },
+                });
+
+                // ให้ flow ต่อไปใช้ logic ชุดเดียวกับหลังจบแบบประเมิน
+                nextActionState.set(userId, "afterQuiz");
               }
-            }  else if (pending === "afterQuiz") {
+            } else if (pending === "afterQuiz") {
               if (normalizedText === "ต้องการ") {
-                // ส่งปุ่มเปิดแผนที่ (template message) + ข้อความขอบคุณ แยกเป็น 2 bubble
+                // ส่งปุ่มเปิดแผนที่ + ข้อความขอบคุณ
                 await replyMessage(replyToken, [
                   {
                     type: "template",
@@ -953,6 +980,7 @@ app.post("/webhook", async (req, res) => {
 
             continue;
           }
+
 
           // 1) ปุ่ม Rich menu: คู่มือ
           if (
